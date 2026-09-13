@@ -1,22 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-bot.py — ビットコイン投資サポート（クラウド版 / GitHub Actions用）
+bot.py — ビットコイン全自動売買＆学びサポート（クラウド版 / GitHub Actions用）
 ======================================================================
-このファイル1本で、これまでのデスクトップ版（main.py / bitflyer_api.py /
-signal_logic.py / notifier.py）と同じロジックをまとめています。
-GitHub Actionsが一定間隔でこのスクリプトを1回だけ実行し、そのたびに
-
-    価格取得 → 判定 → (買い時なら)通知 → 状態保存 → 公開ページ更新
-
-を行います。常駐プロセスではないので、あなたのiPhoneや電源は一切不要です。
-
-■ 設定を変える場合は、下の「設定」セクションの値を書き換えてください。
-■ APIキーなどの秘密情報は、GitHubリポジトリの Secrets から
-  環境変数として渡されます（このファイルには一切書きません）。
-■ 生成される公開ページ（public/index.html）には、価格と判定結果だけを
-  載せています。残高やAPIキーなど個人情報にあたるものは一切載せません
-  （残高は「買い時」通知のメッセージ本文にだけ、あなた個人のDiscord/LINEへ
-  送ります）。
+1時間ごとに価格をチェックし、一時的な下落（押し目）を捉えて
+自動で「1回1,000円分」のビットコインを買い付け、LINEへ通知します。
 """
 
 import hashlib
@@ -29,19 +16,20 @@ from pathlib import Path
 import requests
 
 # ============================================================
-# 設定（ここは自由に書き換えてOK）
+# 設定
 # ============================================================
-DEFAULT_MODE = "standard"       # conservative / standard / aggressive
+DEFAULT_MODE = "aggressive"         # 攻めモード（押し目を敏感に狙う）
 PRODUCT_CODE = "BTC_JPY"
-NOTIFY_COOLDOWN_SECONDS = 60 * 60  # 同じ「買い時」通知を連発しない最短間隔
+BUY_AMOUNT_JPY = 1000               # 1回の自動買い付け金額（1,000円固定）
+NOTIFY_COOLDOWN_SECONDS = 60 * 60   # 通知・連続購入の最短間隔（1時間）
 
-STORE_PATH = Path("state/store.json")     # 価格履歴・通知状態のキャッシュ
+STORE_PATH = Path("state/store.json")
 OUTPUT_DIR = Path("public")
 OUTPUT_HTML = OUTPUT_DIR / "index.html"
 
 
 # ============================================================
-# シグナル判定ロジック（デスクトップ版 signal_logic.py と同一の考え方）
+# シグナル判定ロジック
 # ============================================================
 MODES = {
     "conservative": {
@@ -55,18 +43,18 @@ MODES = {
         "danger_threshold_pct": 5.0,
     },
     "aggressive": {
-        "label": "攻めモード",
-        "buy_threshold_pct": -1.5,
+        "label": "意味のある攻めモード",
+        "buy_threshold_pct": -1.0,  # 直近平均から-1%下がったら押し目と判定して買う
         "danger_threshold_pct": 8.0,
     },
 }
 
-MIN_SAMPLES = 3
-MIN_SPAN_HOURS = 3.0
+MIN_SAMPLES = 2
+MIN_SPAN_HOURS = 1.0
 LOOKBACK_HOURS = 24.0
 
 ZONE_STYLE = {
-    "buy": {"emoji": "🟢", "title": "買い時ゾーン", "bg": "#2ecc71", "fg": "#0b3d20"},
+    "buy": {"emoji": "🟢", "title": "買い時ゾーン（自動買付）", "bg": "#2ecc71", "fg": "#0b3d20"},
     "watch": {"emoji": "🟡", "title": "静観ゾーン", "bg": "#f5c518", "fg": "#4a3800"},
     "danger": {"emoji": "🔴", "title": "危険ゾーン", "bg": "#e74c3c", "fg": "#ffffff"},
     "collecting": {"emoji": "⏳", "title": "データ収集中", "bg": "#95a5a6", "fg": "#ffffff"},
@@ -75,8 +63,6 @@ ZONE_STYLE = {
 
 
 def evaluate(current_price, current_time, history, mode_key=DEFAULT_MODE):
-    """history: [(timestamp, price), ...]。current_price/current_timeとの
-    比較用に、呼び出し側で直近LOOKBACK_HOURS分に絞り込んで渡す。"""
     mode = MODES.get(mode_key, MODES[DEFAULT_MODE])
     past_points = [p for (t, p) in history if t < current_time]
 
@@ -88,10 +74,7 @@ def evaluate(current_price, current_time, history, mode_key=DEFAULT_MODE):
     if len(past_points) < MIN_SAMPLES or span_hours < MIN_SPAN_HOURS:
         remaining_h = max(0.0, MIN_SPAN_HOURS - span_hours)
         style = ZONE_STYLE["collecting"]
-        reason = (
-            f"まだ判定に十分なデータが集まっていません"
-            f"（あと約{remaining_h:.1f}時間ほどでデータが揃います）。"
-        )
+        reason = f"まだ判定データが集まっていません（あと約{remaining_h:.1f}時間）。"
         return {
             "zone": "collecting", "reason": reason, "mode_label": mode["label"],
             "deviation_pct": None, "baseline_avg": None, **style,
@@ -105,20 +88,17 @@ def evaluate(current_price, current_time, history, mode_key=DEFAULT_MODE):
     if deviation_pct <= mode["buy_threshold_pct"]:
         zone = "buy"
         reason = (
-            f"直近平均（{baseline_avg:,.0f}円）より{abs(deviation_pct):.1f}%値下がりして、"
-            "一時的に買いやすくなっているためです。"
+            f"直近平均（{baseline_avg:,.0f}円）より{abs(deviation_pct):.1f}%値下がりした「押し目」を検知しました。"
         )
     elif deviation_pct >= mode["danger_threshold_pct"]:
         zone = "danger"
         reason = (
-            f"直近平均（{baseline_avg:,.0f}円）より{deviation_pct:.1f}%も値上がりしていて、"
-            "高値づかみになりやすいタイミングだからです。"
+            f"直近平均（{baseline_avg:,.0f}円）より{deviation_pct:.1f}%高く、高値掴みのリスクがあるため見送ります。"
         )
     else:
         zone = "watch"
         reason = (
-            f"直近平均（{baseline_avg:,.0f}円）から{deviation_pct:+.1f}%の範囲におさまっていて、"
-            "大きな動きがない落ち着いた状況だからです。"
+            f"直近平均（{baseline_avg:,.0f}円）からのブレが{deviation_pct:+.1f}%の範囲内のため静観します。"
         )
 
     style = ZONE_STYLE[zone]
@@ -129,7 +109,7 @@ def evaluate(current_price, current_time, history, mode_key=DEFAULT_MODE):
 
 
 # ============================================================
-# bitFlyer API（デスクトップ版 bitflyer_api.py と同一の考え方）
+# bitFlyer API（注文処理を追加）
 # ============================================================
 BASE_URL = "https://api.bitflyer.com"
 
@@ -153,8 +133,21 @@ class BitflyerClient:
 
     def get_balance(self):
         if not self.has_credentials():
-            raise BitflyerAPIError("APIキーが設定されていません（Secretsを確認してください）")
+            raise BitflyerAPIError("APIキーが設定されていません")
         return self._request("GET", "/v1/me/getbalance", private=True)
+
+    # 成行買い注文の送信機能
+    def send_buy_order(self, amount_btc, product_code=PRODUCT_CODE):
+        if not self.has_credentials():
+            raise BitflyerAPIError("APIキーが設定されていないため注文できません")
+        
+        body = {
+            "product_code": product_code,
+            "child_order_type": "MARKET",  # 成行注文
+            "side": "BUY",                # 買い
+            "size": round(amount_btc, 8)  # BTC数量（少数第8位まで）
+        }
+        return self._request("POST", "/v1/me/sendchildorder", body=body, private=True)
 
     def _sign(self, method, path_with_query, body_str):
         timestamp = str(time.time())
@@ -187,9 +180,9 @@ class BitflyerClient:
         if resp.status_code == 429:
             raise BitflyerAPIError("レートリミットに達しました")
         if resp.status_code == 401:
-            raise BitflyerAPIError("認証に失敗しました（APIキー/シークレットを確認してください）")
+            raise BitflyerAPIError("認証に失敗しました（APIキーを確認してください）")
         if not resp.ok:
-            raise BitflyerAPIError(f"bitFlyerがエラーを返しました（HTTP {resp.status_code}）")
+            raise BitflyerAPIError(f"bitFlyerエラー（HTTP {resp.status_code}）: {resp.text}")
         try:
             return resp.json()
         except ValueError:
@@ -197,20 +190,9 @@ class BitflyerClient:
 
 
 # ============================================================
-# 通知（デスクトップ版 notifier.py と同一の考え方）
+# 通知
 # ============================================================
 LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
-
-
-def send_discord(message):
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-    if not webhook_url:
-        return False
-    try:
-        resp = requests.post(webhook_url, json={"content": message}, timeout=10)
-        return resp.ok
-    except requests.exceptions.RequestException:
-        return False
 
 
 def send_line(message):
@@ -227,22 +209,12 @@ def send_line(message):
 
 
 def notify_all(message):
-    results = {}
-    if os.environ.get("DISCORD_WEBHOOK_URL", "").strip():
-        results["discord"] = send_discord(message)
     if os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip():
-        results["line"] = send_line(message)
-    return results
-
-
-def has_any_notifier_configured():
-    return bool(os.environ.get("DISCORD_WEBHOOK_URL", "").strip()) or bool(
-        os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
-    )
+        send_line(message)
 
 
 # ============================================================
-# 状態の保存/読込（GitHub Actionsのキャッシュに載せる小さなJSON）
+# 状態保存/読込
 # ============================================================
 def load_store():
     try:
@@ -264,9 +236,6 @@ def save_store(data):
         json.dump(data, f)
 
 
-# ============================================================
-# 公開ページ（価格と判定だけを載せる。残高・鍵は載せない）
-# ============================================================
 def render_html(result, price, updated_at_str, mode_label):
     bg = result["bg"]
     fg = result["fg"]
@@ -277,36 +246,17 @@ def render_html(result, price, updated_at_str, mode_label):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="120">
-<title>ビットコイン投資サポート</title>
+<title>ビットコイン自動売買（攻めモード）</title>
 <style>
-  body {{
-    margin: 0; padding: 24px 16px 40px;
-    background: #f4f5f7;
-    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic UI", sans-serif;
-    color: #1a1a1a;
-  }}
-  .card {{
-    max-width: 480px; margin: 0 auto;
-    background: {bg}; color: {fg};
-    border-radius: 16px; padding: 28px 20px; text-align: center;
-    box-shadow: 0 2px 10px rgba(0,0,0,0.08);
-  }}
+  body {{ margin: 0; padding: 24px 16px; background: #f4f5f7; font-family: sans-serif; color: #1a1a1a; }}
+  .card {{ max-width: 480px; margin: 0 auto; background: {bg}; color: {fg}; border-radius: 16px; padding: 28px 20px; text-align: center; }}
   .emoji {{ font-size: 44px; }}
   .title {{ font-size: 24px; font-weight: 700; margin: 6px 0 10px; }}
   .reason {{ font-size: 15px; line-height: 1.6; }}
-  .price {{
-    max-width: 480px; margin: 16px auto 0; background: #fff;
-    border-radius: 12px; padding: 16px 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.06);
-  }}
+  .price {{ max-width: 480px; margin: 16px auto 0; background: #fff; border-radius: 12px; padding: 16px 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); text-align: center; }}
   .price .label {{ font-size: 12px; color: #666; }}
   .price .value {{ font-size: 28px; font-weight: 700; margin-top: 2px; }}
-  .meta {{
-    max-width: 480px; margin: 10px auto 0; font-size: 12px; color: #888; text-align: center;
-  }}
-  .disclaimer {{
-    max-width: 480px; margin: 18px auto 0; font-size: 11px; color: #999;
-    line-height: 1.6; text-align: left;
-  }}
+  .meta {{ max-width: 480px; margin: 10px auto 0; font-size: 12px; color: #888; text-align: center; }}
 </style>
 </head>
 <body>
@@ -320,11 +270,6 @@ def render_html(result, price, updated_at_str, mode_label):
     <div class="value">{price_text}</div>
   </div>
   <div class="meta">判定モード: {mode_label} ／ 最終更新: {updated_at_str}</div>
-  <div class="disclaimer">
-    ※この判定は直近の価格からの簡易的な目安であり、将来の値動きを保証するものではありません。
-    投資判断はご自身の責任で行ってください。自動売買（発注）は行いません。
-    このページには価格と判定のみを表示しており、残高やAPIキーは表示していません。
-  </div>
 </body>
 </html>
 """
@@ -334,9 +279,7 @@ def render_html(result, price, updated_at_str, mode_label):
 # メイン処理
 # ============================================================
 def main():
-    mode_key = os.environ.get("DEFAULT_MODE", DEFAULT_MODE).strip() or DEFAULT_MODE
-    if mode_key not in MODES:
-        mode_key = DEFAULT_MODE
+    mode_key = DEFAULT_MODE
 
     client = BitflyerClient(
         api_key=os.environ.get("BITFLYER_API_KEY"),
@@ -367,16 +310,28 @@ def main():
     else:
         style = ZONE_STYLE["error"]
         result = {
-            "zone": "error", "reason": "bitFlyerから価格を取得できませんでした。しばらくして自動的に再試行されます。",
-            "mode_label": MODES[mode_key]["label"], "deviation_pct": None, "baseline_avg": None,
-            **style,
+            "zone": "error", "reason": "価格を取得できませんでした。",
+            "mode_label": MODES[mode_key]["label"], "deviation_pct": None, "baseline_avg": None, **style,
         }
 
-    # 「買い時」に新しく入った、またはクールダウンが明けている場合だけ通知する
+    # 「買い時ゾーン」の場合のみ自動買付を実施
     if result["zone"] == "buy":
-        zone_changed = store.get("last_zone") != "buy"
         cooldown_ok = (now - store.get("last_notified_at", 0.0)) >= NOTIFY_COOLDOWN_SECONDS
-        if zone_changed or cooldown_ok:
+        if cooldown_ok:
+            # 1,000円分のBTC数量を計算
+            btc_amount = BUY_AMOUNT_JPY / price
+            order_success = False
+            order_msg = ""
+
+            try:
+                # 自動注文を発注
+                res = client.send_buy_order(btc_amount)
+                order_success = True
+                order_msg = f"【自動購入完了】\n{BUY_AMOUNT_JPY:,}円分（約 {btc_amount:.6f} BTC）の買い注文を発注しました！"
+            except BitflyerAPIError as e:
+                order_msg = f"【自動購入エラー】\n買い条件に達しましたが、注文時にエラーが発生しました: {e}"
+
+            # 最新残高の取得
             balance_line = ""
             if client.has_credentials():
                 try:
@@ -385,32 +340,27 @@ def main():
                     btc = next((b["available"] for b in balances if b.get("currency_code") == "BTC"), None)
                     if jpy is not None and btc is not None:
                         balance_line = f"\n残高: {jpy:,.0f}円 / {btc:.8f} BTC"
-                except BitflyerAPIError as e:
-                    print(f"[WARN] 残高取得に失敗（通知は残高なしで送信します）: {e}")
+                except BitflyerAPIError:
+                    pass
 
-            if has_any_notifier_configured():
-                message = (
-                    f"★買い時です！\n"
-                    f"現在価格: {price:,.0f}円\n"
-                    f"{result['reason']}"
-                    f"{balance_line}\n"
-                    f"（判定モード: {result['mode_label']}）"
-                )
-                notify_all(message)
+            message = (
+                f"🚀 {order_msg}\n"
+                f"現在価格: {price:,.0f}円\n"
+                f"理由: {result['reason']}"
+                f"{balance_line}\n"
+                f"（判定モード: {result['mode_label']}）"
+            )
+            notify_all(message)
             store["last_notified_at"] = now
 
     store["last_zone"] = result["zone"]
     save_store(store)
 
-    # 公開ページを書き出す（価格と判定のみ。残高やキーは含めない）
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Actionsランナーの時刻はUTCなので、+9時間してJST表記にする
     jst = time.gmtime(now + 9 * 3600)
     updated_at_str = time.strftime("%Y-%m-%d %H:%M JST", jst)
     html = render_html(result, price, updated_at_str, MODES[mode_key]["label"])
     OUTPUT_HTML.write_text(html, encoding="utf-8")
-
-    print(f"[INFO] public/index.html を書き出しました（zone={result['zone']}）")
 
 
 if __name__ == "__main__":
