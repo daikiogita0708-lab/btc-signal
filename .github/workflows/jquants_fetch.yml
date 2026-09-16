@@ -24,3 +24,5 @@ jobs:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
         run: |
           python -c "import os; api_key = os.environ.get('JQUANTS_API_KEY'); print('APIキーの読み込み確認:', '成功' if api_key else '失敗')"
+         - name: Run analysis script
+        　run: python analyze_jquants.py 
