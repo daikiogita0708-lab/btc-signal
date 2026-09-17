@@ -3,16 +3,20 @@ import requests
 
 def send_line_message(message):
     token = os.environ.get("LINE_STOCK_TOKEN")
-    if not token:
-        print("エラー: LINE_STOCK_TOKEN が設定されていません。")
+    user_id = os.environ.get("LINE_USER_ID")
+    
+    if not token or not user_id:
+        print("エラー: LINE_STOCK_TOKEN または LINE_USER_ID が設定されていません。")
         return
     
-    url = "https://api.line.me/v2/bot/message/broadcast"
+    # 全員配信(broadcast)ではなく特定のUser ID宛て(push)に送信
+    url = "https://api.line.me/v2/bot/message/push"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}"
     }
     data = {
+        "to": user_id,
         "messages": [
             {
                 "type": "text",
@@ -30,8 +34,7 @@ def send_line_message(message):
 def main():
     print("=== 株価データの分析を開始します ===")
     
-    # テストメッセージをLINEに送信
-    msg = "📈 株価分析botテストメッセージです！\n正常に通知が届きました。"
+    msg = "📈 株価分析botテストメッセージです！\n正常にLINE通知が届きました！"
     send_line_message(msg)
     
     print("分析が正常に終了しました。")
