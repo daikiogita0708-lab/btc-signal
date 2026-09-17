@@ -35,3 +35,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+- name: Run Analysis and Send LINE
+        env:
+          LINE_STOCK_TOKEN: ${{ secrets.LINE_STOCK_TOKEN }}
+        run: python analyze_jquants.py
