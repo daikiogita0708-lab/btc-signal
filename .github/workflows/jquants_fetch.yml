@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  fetch-jquants-data:
+  fetch-and-analyze:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -18,11 +18,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-    - name: Run analysis script
+      - name: Run fetch script
         env:
-          JQUANTS_REFRESH_TOKEN: ${{ secrets.JQUANTS_REFRESH_TOKEN }}
-          LINE_STOCK_TOKEN: ${{ secrets.LINE_STOCK_TOKEN }}
-          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+        run: python fetch_data.py
+
+      - name: Run analysis script
+        env:
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
         run: python analyze_jquants.py
