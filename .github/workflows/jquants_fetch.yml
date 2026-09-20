@@ -20,7 +20,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas
 
-      - name: Run analysis script
+    - name: Run analysis script
         env:
           JQUANTS_REFRESH_TOKEN: ${{ secrets.JQUANTS_REFRESH_TOKEN }}
+          LINE_STOCK_TOKEN: ${{ secrets.LINE_STOCK_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
         run: python analyze_jquants.py
