@@ -2,42 +2,30 @@ import os
 import requests
 
 def send_line_message(message):
-    token = os.environ.get("LINE_STOCK_TOKEN")
+    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
     user_id = os.environ.get("LINE_USER_ID")
     
     if not token or not user_id:
-        print("エラー: LINE_STOCK_TOKEN または LINE_USER_ID が設定されていません。")
+        print("エラー: LINEトークンかユーザーIDがありません")
         return
-    
-    # 全員配信(broadcast)ではなく特定のUser ID宛て(push)に送信
+        
     url = "https://api.line.me/v2/bot/message/push"
     headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
     }
     data = {
         "to": user_id,
-        "messages": [
-            {
-                "type": "text",
-                "text": message
-            }
-        ]
+        "messages": [{"type": "text", "text": message}]
     }
     
     response = requests.post(url, headers=headers, json=data)
-    if response.status_code == 200:
-        print("LINEへの送信に成功しました！")
-    else:
-        print(f"送信失敗: {response.status_code} {response.text}")
-
-def main():
-    print("=== 株価データの分析を開始します ===")
-    
-    msg = "📈 株価分析botテストメッセージです！\n正常にLINE通知が届きました！"
-    send_line_message(msg)
-    
-    print("分析が正常に終了しました。")
+    print(f"LINE送信結果: {response.status_code} {response.text}")
 
 if __name__ == "__main__":
-    main()
+    print("J-Quants APIからのデータ取得とモメンタム分析を開始します...")
+    # --- ここに後でJ-Quantsの分析コードを入れます ---
+    print("分析完了: 本日の処理が正常終了しました。")
+    
+    # LINEにテストメッセージを送信
+    send_line_message("GitHub Actionsからテスト送信！届きましたか？")
