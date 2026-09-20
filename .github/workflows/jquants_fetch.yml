@@ -23,7 +23,7 @@ jobs:
       - name: Run fetch script
         env:
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-        run: python fetch_data.py
+        run: python analyze_jquants.py
 
       - name: Run analysis script
         env:
