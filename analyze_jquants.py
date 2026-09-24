@@ -1,27 +1,30 @@
 """
 analyze_jquants.py
 -------------------
-GitHub Actions(jquants_fetch.yml)から手動/定期実行される、
-日本株の複数銘柄シグナルスクリーニング & LINE通知スクリプト。
+GitHub Actions(jquants_fetch.yml、毎朝の自動実行)から動く、
+日本株の複数銘柄「デイリーレポート」をLINEに届けるスクリプト。
 
 ■ 全体の流れ
     WATCHLIST(監視銘柄コードのリスト)を1銘柄ずつ
       fetch_data.fetch_daily_bars() で直近データ取得
       → indicators.py の関数群でMA・RSI・出来高スパイク・
         ゴールデンクロス/デッドクロス/モメンタム転換を計算
-      → 最新1営業日にシグナルが立っていれば「ヒット」として集計
-    ヒットが1件以上あれば、まとめて1通のLINEメッセージで通知する
-    (銘柄ごとに何通も送るとうるさい・LINEのレート制限にも引っかかりやすいため)
+    → 「シグナルが出た銘柄だけ」ではなく「監視銘柄全部」の状況を
+      毎日1通のLINEメッセージにまとめて通知する(デイリーレポート形式)
+
+■ 重要: 無料プランのデータ遅延について(必ず読んでください)
+    J-QuantsのFreeプランは直近12週間のデータが取得できません。
+    そのため、このレポートに載る「最新データ」は常に実際の市場の
+    約12週間前の日付になります。メッセージの先頭に必ずその日付を
+    表示しているので、「これは過去の検証用データであって、
+    今日の売買判断にそのまま使えるものではない」ことを毎回確認してください。
 
 ■ このファイルを動かす前提
     fetch_data.py と indicators.py が、この analyze_jquants.py と
-    「同じフォルダ」にあること(import で読み込むため)。
-    → これまで .github/workflows/ 直下にあったはずなので、
-      リポジトリのルート(analyze_jquants.pyの隣)に移動しておくこと。
+    同じフォルダ(リポジトリのルート直下)にあること。
 
 ■ 環境変数
     JQUANTS_API_KEY, LINE_CHANNEL_ACCESS_TOKEN, LINE_USER_ID
-    (すべてjquants_fetch.ymlのenv:経由でSecretsから渡される想定)
 
 ■ 実行方法(ローカル/Codespaces)
     $ python analyze_jquants.py
@@ -71,8 +74,8 @@ def send_line_message(message: str, token: str, user_id: str) -> bool:
 
 def analyze_one_stock(code: str, api_key: str) -> dict | None:
     """
-    1銘柄分のデータを取得して指標計算し、最新営業日のシグナル状況を
-    辞書で返す。データが取得できない/足りない場合はNoneを返す。
+    1銘柄分のデータを取得して指標計算し、最新営業日の状況を辞書で返す。
+    データが取得できない/足りない場合はNoneを返す。
     """
     to_date_dt = datetime.today() - timedelta(weeks=fetch_data.FREE_PLAN_DELAY_WEEKS)
     from_date_dt = to_date_dt - timedelta(days=LOOKBACK_CALENDAR_DAYS)
@@ -94,6 +97,7 @@ def analyze_one_stock(code: str, api_key: str) -> dict | None:
 
     df = indicators.add_moving_averages(df, "Close")
     df = indicators.add_rsi(df, "Close")
+    df = indicators.add_daily_change(df, "Close")
     df = indicators.add_volume_spike_signal(df, "Volume")
     df = indicators.add_golden_cross_signal(df, "MA5", "MA25")
     df = indicators.add_golden_cross_signal(df, "MA25", "MA75")
@@ -108,6 +112,7 @@ def analyze_one_stock(code: str, api_key: str) -> dict | None:
         "code": code,
         "date": latest["Date"].date(),
         "close": latest["Close"],
+        "change_pct": latest["change_pct"],
         "rsi": latest["RSI14"],
         "golden_cross_5_25": bool(latest["golden_cross_MA5_MA25"]),
         "golden_cross_25_75": bool(latest["golden_cross_MA25_MA75"]),
@@ -120,29 +125,35 @@ def analyze_one_stock(code: str, api_key: str) -> dict | None:
     }
 
 
-def format_hit_message(result: dict, name: str) -> str:
+def signal_tags(result: dict) -> list:
     tags = []
     if result["golden_cross_5_25"]:
-        tags.append("🟢ゴールデンクロス(5×25)")
+        tags.append("🟢GC(5×25)")
     if result["golden_cross_25_75"]:
-        tags.append("🟢ゴールデンクロス(25×75)")
+        tags.append("🟢GC(25×75)")
     if result["dead_cross_5_25"]:
-        tags.append("🔴デッドクロス(5×25)")
+        tags.append("🔴DC(5×25)")
     if result["dead_cross_25_75"]:
-        tags.append("🔴デッドクロス(25×75)")
+        tags.append("🔴DC(25×75)")
     if result["volume_spike"]:
         tags.append("📊出来高急増")
     if result["momentum_up"]:
-        tags.append("⤴モメンタム上向き(RSI>50)")
+        tags.append("⤴モメンタム上向き")
     if result["rsi_overbought"]:
-        tags.append("⚠買われすぎ(RSI>70)")
+        tags.append("⚠買われすぎ")
     if result["rsi_oversold"]:
-        tags.append("🔵売られすぎ(RSI<30)")
+        tags.append("🔵売られすぎ")
+    return tags
 
+
+def format_stock_line(result: dict, name: str) -> str:
+    arrow = "▲" if result["change_pct"] > 0 else ("▼" if result["change_pct"] < 0 else "→")
+    tags = signal_tags(result)
+    tag_line = " / ".join(tags) if tags else "特になし"
     return (
         f"{name}({result['code'][:4]})\n"
-        f"{' / '.join(tags)}\n"
-        f"終値: {result['close']:,.0f}円 / RSI14: {result['rsi']:.1f}"
+        f"  終値 {result['close']:,.0f}円 ({arrow}{result['change_pct']:+.1f}%) / RSI14 {result['rsi']:.1f}\n"
+        f"  シグナル: {tag_line}"
     )
 
 
@@ -150,35 +161,45 @@ def main():
     api_key = fetch_data.get_api_key()
     line_token, line_user_id = get_line_credentials()
 
-    print(f"監視銘柄 {len(WATCHLIST)}件のシグナルをチェックします...")
+    print(f"監視銘柄 {len(WATCHLIST)}件のデイリーレポートを作成します...")
 
-    hit_messages = []
+    lines = []
+    data_dates = []
+    hit_count = 0
+    failed_names = []
+
     for i, (code, name) in enumerate(WATCHLIST.items()):
         if i > 0:
             time.sleep(REQUEST_INTERVAL_SEC)
 
         result = analyze_one_stock(code, api_key)
         if result is None:
+            failed_names.append(name)
             continue
 
-        any_signal = any([
-            result["golden_cross_5_25"], result["golden_cross_25_75"],
-            result["dead_cross_5_25"], result["dead_cross_25_75"],
-            result["volume_spike"], result["momentum_up"],
-            result["rsi_overbought"], result["rsi_oversold"],
-        ])
-        print(f"  {code}({name}): {'シグナルあり' if any_signal else 'シグナルなし'} (終値{result['close']:,.0f}円 / RSI{result['rsi']:.1f})")
+        data_dates.append(result["date"])
+        if signal_tags(result):
+            hit_count += 1
 
-        if any_signal:
-            hit_messages.append(format_hit_message(result, name))
+        print(f"  {code}({name}): 終値{result['close']:,.0f}円 / RSI{result['rsi']:.1f} / シグナル{len(signal_tags(result))}件")
+        lines.append(format_stock_line(result, name))
 
-    if not hit_messages:
-        print("本日は条件に合致する銘柄はありませんでした。LINE通知はスキップします。")
+    if not lines:
+        print("全銘柄でデータ取得に失敗しました。LINE通知はスキップします。")
         return
 
-    header = f"📈 本日のシグナル検出({len(hit_messages)}件)\n" + "-" * 20 + "\n"
-    body = ("\n" + "-" * 20 + "\n").join(hit_messages)
-    message = header + body
+    data_date_str = max(data_dates).isoformat() if data_dates else "不明"
+    header = (
+        f"📊 株価デイリーレポート(データ基準日: {data_date_str})\n"
+        f"※無料プランのため実際の市場より約{fetch_data.FREE_PLAN_DELAY_WEEKS}週間前のデータです\n"
+        f"要注目シグナル: {hit_count}/{len(lines)}銘柄\n"
+        + "-" * 20
+    )
+    footer = ""
+    if failed_names:
+        footer = "\n" + "-" * 20 + f"\n取得失敗: {', '.join(failed_names)}"
+
+    message = header + "\n" + ("\n" + "-" * 20 + "\n").join(lines) + footer
     if len(message) > MAX_LINE_MESSAGE_LEN:
         message = message[:MAX_LINE_MESSAGE_LEN] + "\n…(以下省略)"
 
