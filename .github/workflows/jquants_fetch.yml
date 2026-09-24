@@ -2,6 +2,10 @@ name: Fetch J-Quants Data
 
 on:
   workflow_dispatch:
+  schedule:
+    # 毎週月〜金 07:30 JST に実行(cronはUTC基準。22:30 UTC(日〜木)= 翌07:30 JST)
+    # ※GitHub Actionsのscheduleは実行環境の混雑状況で数分〜数十分遅れることがある
+    - cron: '30 22 * * 0-4'
 
 jobs:
   fetch-and-analyze:
