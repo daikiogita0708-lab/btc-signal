@@ -82,6 +82,38 @@ def add_golden_cross_signal(df: pd.DataFrame, short_col: str, long_col: str) -> 
     return df
 
 
+def add_dead_cross_signal(df: pd.DataFrame, short_col: str, long_col: str) -> pd.DataFrame:
+    """
+    デッドクロス: 短期線が長期線を「上から下に抜けた瞬間」だけTrue。
+    ゴールデンクロスの対になる決済(手仕舞い)判断用のシグナル。
+    バックテストではこれを「ポジションを閉じるタイミング」として使う想定。
+    """
+    is_below = df[short_col] < df[long_col]
+    was_above = df[short_col].shift(1) >= df[long_col].shift(1)
+    df[f"dead_cross_{short_col}_{long_col}"] = is_below & was_above
+    return df
+
+
+def add_threshold_cross_signal(
+    df: pd.DataFrame, value_col: str, threshold: float, direction: str = "up"
+) -> pd.DataFrame:
+    """
+    ゴールデンクロス/デッドクロスの「相手が別の線ではなく定数(閾値)」版。
+    value_colがthresholdを上向き("up")/下向き("down")に抜けた瞬間だけTrueにする。
+
+    例: RSIが50を上に抜けた瞬間を「モメンタムが上向きに転換した」とみなす、など。
+    (RSIの伝統的な30/70ラインの逆張りシグナルにも使える)
+    """
+    if direction == "up":
+        crossed = (df[value_col] > threshold) & (df[value_col].shift(1) <= threshold)
+    elif direction == "down":
+        crossed = (df[value_col] < threshold) & (df[value_col].shift(1) >= threshold)
+    else:
+        raise ValueError("direction は 'up' か 'down' を指定してください")
+    df[f"{value_col}_cross_{direction}_{threshold:g}"] = crossed
+    return df
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit("使い方: python indicators.py <fetch_data.pyが出力したCSVファイル>")
@@ -110,6 +142,8 @@ def main():
     df = add_volume_spike_signal(df, volume_col)
     df = add_golden_cross_signal(df, "MA5", "MA25")   # 短期(攻めの初動狙い)
     df = add_golden_cross_signal(df, "MA25", "MA75")  # 中期(伝統的なゴールデンクロス)
+    df = add_dead_cross_signal(df, "MA5", "MA25")     # 上の2つに対応する手仕舞いシグナル
+    df = add_dead_cross_signal(df, "MA25", "MA75")
 
     output_path = input_path.replace(".csv", "_signals.csv")
     df.to_csv(output_path, index=False, encoding="utf-8-sig")
