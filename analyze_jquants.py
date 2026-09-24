@@ -208,4 +208,8 @@ def main():
 
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     main()
+=======
+    main()
+>>>>>>> 693a37b (Update analyze_jquants and add daily cron schedule)
