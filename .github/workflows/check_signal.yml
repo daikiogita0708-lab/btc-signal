@@ -5,6 +5,10 @@ on:
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
+concurrency:
+  group: btc-signal-check
+  cancel-in-progress: false
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -31,9 +35,30 @@ jobs:
         env:
           BITFLYER_API_KEY: ${{ secrets.BITFLYER_API_KEY }}
           BITFLYER_API_SECRET: ${{ secrets.BITFLYER_API_SECRET }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
         run: python bot.py
+
+      # 価格履歴(state/store.json)をリポジトリにコミットして残す。
+      # これが無いと、次回の実行時に履歴が引き継がれず「収集中」のまま進まない。
+      - name: Commit price history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/store.json
+          if git diff --cached --quiet; then
+            echo "No history changes to commit"
+          else
+            git commit -m "Update BTC price history [skip ci]"
+            # cron実行が重なって衝突した場合に備えて、1回だけ再取得して再試行する
+            for i in 1 2; do
+              if git push; then
+                break
+              else
+                echo "Push failed, retrying with rebase ($i)"
+                git pull --rebase
+              fi
+            done
+          fi
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
