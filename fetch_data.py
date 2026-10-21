@@ -36,6 +36,7 @@ analyze_jquants.py からも import して使う。単体で実行するとCSV�
 """
 
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -53,6 +54,10 @@ FREE_PLAN_DELAY_WEEKS = DELAY_WEEKS  # 旧名。他ファイルとの互換の�
 MIN_REQUEST_INTERVAL_SEC = float(os.environ.get("JQUANTS_MIN_INTERVAL_SEC", "13"))
 RATE_LIMIT_WAIT_SEC = 65   # 429を受けたら1分以上待つ(公式は1〜2分の待機を推奨)
 MAX_RETRIES_ON_429 = 2
+INTERVAL_STEP_AFTER_429_SEC = 2.0   # 429を受けたら、以後のリクエスト間隔を少し広げる(同じ失敗の繰り返しを防ぐ)
+MAX_INTERVAL_SEC = 30.0
+RUN_DEADLINE_SEC = float(os.environ.get("RUN_DEADLINE_SEC", "1200"))  # 20分。Actionsの上限25分より手前でデータ取得を打ち切り、取れた分でレポートを送る
+_run_started_at = time.monotonic()  # スクリプトを動かし始めた時刻
 MAX_PAGES = 20             # ページネーションの無限ループ防止
 
 USE_ADJUSTED_PRICES = True
@@ -76,14 +81,36 @@ def get_api_key() -> str:
     return api_key
 
 
+def _api_error_message(resp) -> str:
+    """HTTPエラー時にAPIが返す理由(messageなど)を短く取り出す。ログで原因をすぐ特定するために使う。"""
+    try:
+        body = resp.json()
+        msg = body.get("message") if isinstance(body, dict) else None
+        return str(msg if msg else body)[:300]
+    except ValueError:
+        return (resp.text or "")[:300]
+
+
+def _http_error(resp, params: dict) -> requests.HTTPError:
+    """APIの返答(理由)と、どんな条件で呼んだかを含めた例外を作る。"""
+    shown = "&".join(f"{k}={v}" for k, v in params.items() if k != "pagination_key")
+    return requests.HTTPError(
+        f"{resp.status_code} {resp.reason}: {_api_error_message(resp)} (条件: {shown})", response=resp)
+
+
 def _throttled_get(url: str, params: dict, headers: dict) -> dict:
     """
     レート制限を守りながらGETする。
     - 前回のリクエストから MIN_REQUEST_INTERVAL_SEC 経っていなければ待つ
-    - 429が返ったら RATE_LIMIT_WAIT_SEC 待って再試行(最大 MAX_RETRIES_ON_429 回)
+    - 429が返ったら RATE_LIMIT_WAIT_SEC 待って再試行(最大 MAX_RETRIES_ON_429 回)。
+      同時に以後のリクエスト間隔も少し広げて、同じ失敗を繰り返さないようにする
+    - それ以外のエラーは、APIが返した理由(message)つきの例外にする
     """
-    global _last_request_at
+    global _last_request_at, MIN_REQUEST_INTERVAL_SEC
+    resp = None
     for attempt in range(MAX_RETRIES_ON_429 + 1):
+        if time.monotonic() - _run_started_at > RUN_DEADLINE_SEC:
+            raise TimeoutError(f"実行開始から{RUN_DEADLINE_SEC / 60:.0f}分を超えたため、これ以上のデータ取得を打ち切ります")
         if _last_request_at is not None:
             wait = MIN_REQUEST_INTERVAL_SEC - (time.monotonic() - _last_request_at)
             if wait > 0:
@@ -93,17 +120,18 @@ def _throttled_get(url: str, params: dict, headers: dict) -> dict:
         _last_request_at = time.monotonic()
 
         if resp.status_code != 429:
-            resp.raise_for_status()  # 認証エラー等はここで例外
+            if resp.status_code >= 400:
+                raise _http_error(resp, params)  # 認証エラー・期間の指定ミス等
             return resp.json()
 
+        MIN_REQUEST_INTERVAL_SEC = min(MIN_REQUEST_INTERVAL_SEC + INTERVAL_STEP_AFTER_429_SEC, MAX_INTERVAL_SEC)
         if attempt == MAX_RETRIES_ON_429:
             break
         print(f"[WARN] レート制限(429)に達しました。{RATE_LIMIT_WAIT_SEC}秒待って再試行します"
-              f"({attempt + 1}/{MAX_RETRIES_ON_429})")
+              f"({attempt + 1}/{MAX_RETRIES_ON_429})。以後のリクエスト間隔を{MIN_REQUEST_INTERVAL_SEC:.0f}秒に広げます")
         time.sleep(RATE_LIMIT_WAIT_SEC)
 
-    resp.raise_for_status()
-    return {}  # ここには来ない(raise_for_statusが例外を出す)
+    raise _http_error(resp, params)
 
 
 def _extract_records(payload: dict) -> list:
@@ -129,13 +157,60 @@ def normalize_columns(df: pd.DataFrame, use_adjusted: bool = USE_ADJUSTED_PRICES
     return df[list(rename_map.keys())].rename(columns=rename_map)
 
 
+_ALLOWED_RANGE_RE = re.compile(
+    r"(\d{4})[-/]?(\d{2})[-/]?(\d{2})\s*(?:~|〜|～|to|-)\s*(\d{4})[-/]?(\d{2})[-/]?(\d{2})")
+
+
+def _allowed_range(msg: str):
+    """400のメッセージ('Your subscription covers the following dates: 2024-07-29 ~ 2026-07-29' など)から
+    プランで取得できる期間(YYYYMMDD, YYYYMMDD)を取り出す。読み取れなければ None。"""
+    m = _ALLOWED_RANGE_RE.search(msg or "")
+    if not m:
+        return None
+    g = m.groups()
+    lo, hi = "".join(g[0:3]), "".join(g[3:6])
+    try:
+        datetime.strptime(lo, "%Y%m%d")
+        datetime.strptime(hi, "%Y%m%d")
+    except ValueError:
+        return None
+    return lo, hi
+
+
 def fetch_daily_bars(code: str, from_date: str, to_date: str, api_key: str) -> pd.DataFrame:
     """
     銘柄コード(5桁、例: トヨタ自動車なら"72030")の日足四本値・出来高を取得する。
     レスポンスが複数ページに分かれた場合(pagination_key)も最後まで取得する。
+
+    期間がプランの提供範囲(Freeは「12週間前〜2年12週間前」)を超えると、APIは400を返す。
+    その場合は次の順で1回だけやり直す(公式FAQ: 期間を省略するとプランの範囲に自動調整される)。
+      (1) エラーメッセージに書かれた提供範囲に合わせて、期間を狭めて再取得
+      (2) 範囲が読み取れなければ、期間を省略して再取得
     """
-    params = {"code": code, "from": from_date, "to": to_date}
-    records = _get_all_pages(f"{API_BASE}/equities/bars/daily", params, api_key)
+    url = f"{API_BASE}/equities/bars/daily"
+    try:
+        records = _get_all_pages(url, {"code": code, "from": from_date, "to": to_date}, api_key)
+    except requests.HTTPError as e:
+        resp = getattr(e, "response", None)
+        if resp is None or resp.status_code != 400:
+            raise
+        reason = _api_error_message(resp)
+        allowed = _allowed_range(reason)
+        new_from = new_to = ""
+        if allowed:
+            # 提供範囲の境界ぎりぎりで弾かれないよう、内側に1日ずつ寄せる
+            inner_lo = (datetime.strptime(allowed[0], "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d")
+            inner_hi = (datetime.strptime(allowed[1], "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
+            new_from, new_to = max(from_date, inner_lo), min(to_date, inner_hi)
+        if allowed and new_from <= new_to:
+            print(f"[INFO] {code}: 取得期間がプランの提供範囲({allowed[0]}〜{allowed[1]})を超えていたので、"
+                  f"{new_from}〜{new_to}に合わせて再取得します")
+            retry_params = {"code": code, "from": new_from, "to": new_to}
+        else:
+            print(f"[INFO] {code}: 期間指定で400が返りました({reason[:80]})。"
+                  f"期間を省略して(プランの範囲に自動調整されます)再取得します")
+            retry_params = {"code": code}
+        records = _get_all_pages(url, retry_params, api_key)
     df = pd.DataFrame(records)
     if df.empty:
         return df

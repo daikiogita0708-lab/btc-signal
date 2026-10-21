@@ -92,7 +92,10 @@ NEW_HIGH_LOW_WINDOW = 60   # 何日高値/安値を「更新」とみなすか
 RANGE_WINDOW = 250         # 約1年(52週)のレンジ
 
 # ============ 過去実績・地合い ============
-LOOKBACK_CALENDAR_DAYS = 760   # 約2年分取得(過去実績の母数と1年レンジ計算のため)
+# Freeプランで取れる期間は「12週間前〜2年12週間前」(公式仕様)。範囲外を指定するとAPIが400を返すので、
+# 2年(730日)ぴったりではなく、日付のずれ(UTCとJST・うるう年)に備えて30日の余裕を持たせた700日にしている。
+# 有料プランで長く取りたくなったら、この数字を増やす(Lightは5年分なので1200日くらいまでOK)。
+LOOKBACK_CALENDAR_DAYS = 700   # 約2年弱を取得(過去実績の母数と1年レンジ計算のため)
 FORWARD_RETURN_HORIZON = 5     # シグナルから何営業日後のリターンを見るか(約1週間)
 MIN_RELIABLE_SAMPLE = 5        # これ未満のNは「参考程度」と注記
 BREADTH_STRONG_TH = 60         # 上昇トレンド銘柄の比率(%)がこれ以上: 地合い強い
@@ -109,6 +112,7 @@ MAX_BUBBLE_LEN = 4800          # 吹き出し1つあたりの上限(5000文字)�
 JST = timezone(timedelta(hours=9))
 WEEKDAY_JA = "月火水木金土日"
 SEP = "\n" + "-" * 18 + "\n"
+LAST_FETCH_ERROR = ""   # 直近のデータ取得エラー(全銘柄が失敗した時のLINEお知らせに使う)
 
 
 # =====================================================================
@@ -424,11 +428,13 @@ def detect_events(df: pd.DataFrame) -> list:
 
 def analyze_one_stock(code: str, name: str, api_key: str):
     """戻り値: (分析結果の辞書, 指標計算済みのDataFrame)。失敗時は None。"""
+    global LAST_FETCH_ERROR
     to_dt = fetch_data.latest_available_date()
     from_dt = to_dt - timedelta(days=LOOKBACK_CALENDAR_DAYS)
     try:
         df = fetch_data.fetch_daily_bars(code, from_dt.strftime("%Y%m%d"), to_dt.strftime("%Y%m%d"), api_key)
     except Exception as e:  # noqa: BLE001 - 1銘柄の失敗で全体を止めないため
+        LAST_FETCH_ERROR = str(e)[:200]
         print(f"[WARN] {code}({name}): データ取得に失敗しました: {e}")
         return None
 
@@ -752,7 +758,15 @@ def main():
         print(f"  {code}({name}): 終値{r['close']:,.0f}円 / RSI{r['rsi']:.0f} / スコア{r['score']} / 変化{len(r['events'])}件")
 
     if not results:
-        print("全銘柄でデータ取得に失敗しました。LINE通知はスキップします。")
+        print("全銘柄でデータ取得に失敗しました。")
+        alert = ("⚠️ 本日の株レポートを作れませんでした。\n"
+                 "全銘柄のデータ取得に失敗しました。\n"
+                 f"原因(APIの返答): {LAST_FETCH_ERROR or '不明'}\n"
+                 "GitHubの Actions タブでログを確認してください。")
+        try:
+            send_line_messages([alert], line_token, line_user_id)
+        except Exception as e:  # noqa: BLE001 - お知らせの送信失敗で、本来のエラー終了を隠さない
+            print(f"[WARN] 失敗のお知らせをLINEに送れませんでした: {e}")
         sys.exit(1)  # Actions上で失敗(赤)として見えるようにする
 
     breadth_pct = sum(r["trend_up"] for r in results) / len(results) * 100
