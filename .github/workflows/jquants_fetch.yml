@@ -33,8 +33,11 @@ jobs:
 
           # ── 株専用のLINE(推奨) ──
           # 設定すると株の通知はこちらのチャネルに届く(BTC用とは別のトーク)。
-          # 未設定ならBTCと共用の下2つにフォールバックする。
-          LINE_STOCK_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_STOCK_CHANNEL_ACCESS_TOKEN }}
+          # トークンは、Secretsの LINE_STOCK_CHANNEL_ACCESS_TOKEN でも、登録済みの LINE_STOCK_TOKEN でもOK。
+          # 宛先ユーザーID(LINE_STOCK_USER_ID)は、株専用チャネルがBTCと別のLINEプロバイダにある場合だけ登録が必要。
+          # 同じプロバイダなら、下の LINE_USER_ID(BTCと共通)がそのまま使われる。
+          # 未設定ならBTCと共用の下2つにフォールバックする。株専用チャネルに送れなかった時も、BTC共用に切り替えて再送する。
+          LINE_STOCK_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_STOCK_CHANNEL_ACCESS_TOKEN || secrets.LINE_STOCK_TOKEN }}
           LINE_STOCK_USER_ID: ${{ secrets.LINE_STOCK_USER_ID }}
 
           # ── BTCと共用(フォールバック) ──
