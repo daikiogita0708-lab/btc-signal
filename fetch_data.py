@@ -1,58 +1,68 @@
 """
 fetch_data.py
 -------------
-「攻めの株式投資シグナルアプリ」の第一歩:
-J-Quants APIから日本株の日足データを取得してCSVに保存するだけのスクリプト。
+J-Quants API(V2)から日本株の日足データを取得する、APIクライアント部分。
+analyze_jquants.py からも import して使う。単体で実行するとCSVに保存する。
 
 ■ 前提
 - https://jpx-jquants.com/ でアカウント登録し、ダッシュボードの「API Keys」画面で
   APIキーを発行済みであること(V2はリフレッシュトークン等は不要な単純なAPIキー方式)
-- Freeプランは「直近12週間」のデータが取得できない(遅延配信)。
-  つまりこのスクリプトで取れるのは"過去データ"のみで、当日のシグナル検知には使えない。
-  → だからこそ、まずはバックテスト・学習用のデータ収集から始めるのが正しい順番。
 - APIキーは環境変数 JQUANTS_API_KEY から読む。コードに直接書き込まないこと。
 
-■ ローカルPCなしで動かす場合(GitHub Codespaces / github.dev)
-    ターミナルで:
-    $ export JQUANTS_API_KEY="発行されたAPIキー"
-    $ pip install requests pandas --break-system-packages
-    $ python fetch_data.py
+■ プランによる違い(2026年10月時点の公式仕様)
+    プラン      月額      データ遅延   レート制限
+    Free        0円       12週間       5回/分
+    Light       1,650円   なし         60回/分
+    Standard    3,300円   なし         120回/分
+    → 有料プランに切り替えた場合は、コードを書き換えずに環境変数だけで対応できる:
+        JQUANTS_DELAY_WEEKS=0          (遅延なし)
+        JQUANTS_MIN_INTERVAL_SEC=1.1   (60回/分に合わせた間隔)
 
-■ GitHub Actionsで自動実行する場合
-    リポジトリの Settings > Secrets and variables > Actions で
-    JQUANTS_API_KEY をシークレット登録し、ワークフローのenvから渡す
-    (bot.pyのbitFlyerキーと同じ扱い方でOK)。
+■ レート制限について(重要)
+    Freeプランは「1分あたり5回」まで。超えると 429 Too Many Requests が返り、
+    429になったリクエストも回数に数えられるので、連打すると余計に回復が遅れる。
+    そのためこのモジュールでは、全リクエストの間隔を自動で MIN_REQUEST_INTERVAL_SEC
+    以上空け、万一429が返ってきたら1分以上待ってから再試行する。
 
 ■ レスポンス列名について(2026年9月に公式リファレンスで確認済み)
     https://jpx-jquants.com/ja/spec/eq-bars-daily
     V2 APIは "O/H/L/C/Vo"(調整前)と "AdjO/AdjH/AdjL/AdjC/AdjVo"(調整済み)という
-    短縮キー名で四本値・出来高を返す。ここでは株式分割等があっても移動平均線が
-    不連続にならないよう、調整済み株価(Adj系)を使い、indicators.py側が期待する
-    Date/Open/High/Low/Close/Volume という分かりやすい列名に変換して保存する。
-    (もし今後さらに仕様変更があれば、下の USE_ADJUSTED_PRICES と RESPONSE_COLUMN_MAP
-    だけ直せばよい)
+    短縮キー名で四本値・出来高を返す。株式分割等で移動平均線が不連続にならないよう
+    調整済み株価(Adj系)を使い、Date/Open/High/Low/Close/Volume に変換して返す。
+
+■ 単体での実行方法(GitHub Codespaces等)
+    $ export JQUANTS_API_KEY="発行されたAPIキー"
+    $ python fetch_data.py
 """
 
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
 import requests
 
 API_BASE = "https://api.jquants.com/v2"
-FREE_PLAN_DELAY_WEEKS = 12  # Freeプランのデータ遅延期間(公式仕様、2026年9月時点)
 
-# 調整済み株価(分割・配当の影響を除いた連続的な価格)を使うかどうか。
-# 生の始値/終値をそのまま使うと、株式分割があった銘柄でMAが不連続な
-# ギザギザになり、ゴールデンクロス等が誤検知されやすいため True を既定にしている。
+# データ遅延(週)。Freeは12週。有料プランなら環境変数で0にする。
+DELAY_WEEKS = int(os.environ.get("JQUANTS_DELAY_WEEKS", "12"))
+FREE_PLAN_DELAY_WEEKS = DELAY_WEEKS  # 旧名。他ファイルとの互換のため残している
+
+# リクエスト間隔(秒)。Free(5回/分)なら12秒以上必要なので、余裕を見て13秒。
+MIN_REQUEST_INTERVAL_SEC = float(os.environ.get("JQUANTS_MIN_INTERVAL_SEC", "13"))
+RATE_LIMIT_WAIT_SEC = 65   # 429を受けたら1分以上待つ(公式は1〜2分の待機を推奨)
+MAX_RETRIES_ON_429 = 2
+MAX_PAGES = 20             # ページネーションの無限ループ防止
+
 USE_ADJUSTED_PRICES = True
 
-# APIレスポンスの実際のキー名 → indicators.py/backtest_signals.py が期待する分かりやすい名前
 RESPONSE_COLUMN_MAP = {
     True: {"Date": "Date", "AdjO": "Open", "AdjH": "High", "AdjL": "Low", "AdjC": "Close", "AdjVo": "Volume"},
     False: {"Date": "Date", "O": "Open", "H": "High", "L": "Low", "C": "Close", "Vo": "Volume"},
 }
+
+_last_request_at = None  # 直前にリクエストを送った時刻(time.monotonic)
 
 
 def get_api_key() -> str:
@@ -66,6 +76,36 @@ def get_api_key() -> str:
     return api_key
 
 
+def _throttled_get(url: str, params: dict, headers: dict) -> dict:
+    """
+    レート制限を守りながらGETする。
+    - 前回のリクエストから MIN_REQUEST_INTERVAL_SEC 経っていなければ待つ
+    - 429が返ったら RATE_LIMIT_WAIT_SEC 待って再試行(最大 MAX_RETRIES_ON_429 回)
+    """
+    global _last_request_at
+    for attempt in range(MAX_RETRIES_ON_429 + 1):
+        if _last_request_at is not None:
+            wait = MIN_REQUEST_INTERVAL_SEC - (time.monotonic() - _last_request_at)
+            if wait > 0:
+                time.sleep(wait)
+
+        resp = requests.get(url, params=params, headers=headers, timeout=30)
+        _last_request_at = time.monotonic()
+
+        if resp.status_code != 429:
+            resp.raise_for_status()  # 認証エラー等はここで例外
+            return resp.json()
+
+        if attempt == MAX_RETRIES_ON_429:
+            break
+        print(f"[WARN] レート制限(429)に達しました。{RATE_LIMIT_WAIT_SEC}秒待って再試行します"
+              f"({attempt + 1}/{MAX_RETRIES_ON_429})")
+        time.sleep(RATE_LIMIT_WAIT_SEC)
+
+    resp.raise_for_status()
+    return {}  # ここには来ない(raise_for_statusが例外を出す)
+
+
 def _extract_records(payload: dict) -> list:
     """レスポンスJSONから実データのリストを取り出す。"""
     for key in ("data", "daily_quotes", "bars"):
@@ -75,10 +115,7 @@ def _extract_records(payload: dict) -> list:
 
 
 def normalize_columns(df: pd.DataFrame, use_adjusted: bool = USE_ADJUSTED_PRICES) -> pd.DataFrame:
-    """
-    APIの短縮カラム名(O/H/L/C/Vo または AdjO/AdjH/AdjL/AdjC/AdjVo)を
-    Date/Open/High/Low/Close/Volume に統一する。
-    """
+    """APIの短縮カラム名を Date/Open/High/Low/Close/Volume に統一する。"""
     rename_map = RESPONSE_COLUMN_MAP[use_adjusted]
     missing = [c for c in rename_map if c not in df.columns]
     if missing:
@@ -95,34 +132,73 @@ def normalize_columns(df: pd.DataFrame, use_adjusted: bool = USE_ADJUSTED_PRICES
 def fetch_daily_bars(code: str, from_date: str, to_date: str, api_key: str) -> pd.DataFrame:
     """
     銘柄コード(5桁、例: トヨタ自動車なら"72030")の日足四本値・出来高を取得する。
-    yfinanceの"7203.T"表記とは異なるので注意。
+    レスポンスが複数ページに分かれた場合(pagination_key)も最後まで取得する。
     """
-    headers = {"x-api-key": api_key}
     params = {"code": code, "from": from_date, "to": to_date}
-
-    resp = requests.get(
-        f"{API_BASE}/equities/bars/daily",
-        params=params,
-        headers=headers,
-        timeout=30,
-    )
-    resp.raise_for_status()  # 認証エラーなどはここで例外として止まる
-    payload = resp.json()
-
-    records = _extract_records(payload)
+    records = _get_all_pages(f"{API_BASE}/equities/bars/daily", params, api_key)
     df = pd.DataFrame(records)
     if df.empty:
         return df
-    return normalize_columns(df)
+    df = normalize_columns(df)
+    return df.drop_duplicates(subset="Date").reset_index(drop=True)
+
+
+def _get_all_pages(url: str, params: dict, api_key: str) -> list:
+    """pagination_key をたどって全ページ分のレコードを集める(同じキーが返り続けても無限ループしない)。"""
+    headers = {"x-api-key": api_key}
+    records, seen_keys = [], set()
+    for _ in range(MAX_PAGES):
+        payload = _throttled_get(url, params, headers)
+        records.extend(_extract_records(payload))
+        next_key = payload.get("pagination_key")
+        if not next_key or next_key in seen_keys:
+            break
+        seen_keys.add(next_key)
+        params = {**params, "pagination_key": next_key}
+    return records
+
+
+def fetch_market_bars(date: str, api_key: str) -> pd.DataFrame:
+    """
+    指定日の『全上場銘柄』の日足を取得する(codeを指定せずdateだけ指定すると全銘柄が返る。公式仕様で確認済み)。
+    市場全体スキャン用なので、必要な列(Code/調整後終値/調整後出来高/売買代金)だけ返す。
+    """
+    records = _get_all_pages(f"{API_BASE}/equities/bars/daily", {"date": date}, api_key)
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+    need = {"Code": "Code", "Date": "Date", "AdjC": "Close", "AdjVo": "Volume", "Va": "Turnover"}
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        raise KeyError(f"全銘柄データに想定した列がありません: {missing} / 実際: {list(df.columns)}")
+    return df[list(need)].rename(columns=need)
+
+
+def fetch_master(api_key: str) -> pd.DataFrame:
+    """
+    上場銘柄一覧(銘柄コード・会社名・市場区分・業種)を取得する。
+    フィールド名は公式リファレンス(https://jpx-jquants.com/ja/spec/eq-master)で確認済み。
+    """
+    records = _get_all_pages(f"{API_BASE}/equities/master", {}, api_key)
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+    cols = [c for c in ("Code", "CoName", "MktNm", "S33Nm") if c in df.columns]
+    return df[cols].drop_duplicates(subset="Code", keep="last")
+
+
+def latest_available_date() -> datetime:
+    """プランのデータ遅延を考慮した『取得できる最新日』。"""
+    return datetime.today() - timedelta(weeks=DELAY_WEEKS)
 
 
 def main():
     api_key = get_api_key()
 
     target_code = "72030"  # トヨタ自動車。動作確認用に好きな銘柄コードに変更してOK
-    today = datetime.today()
-    to_date = (today - timedelta(weeks=FREE_PLAN_DELAY_WEEKS)).strftime("%Y%m%d")
-    from_date = (today - timedelta(weeks=FREE_PLAN_DELAY_WEEKS + 52)).strftime("%Y%m%d")
+    to_dt = latest_available_date()
+    from_dt = to_dt - timedelta(weeks=52)
+    from_date, to_date = from_dt.strftime("%Y%m%d"), to_dt.strftime("%Y%m%d")
 
     print(f"{target_code} の日足データを {from_date}〜{to_date} の範囲で取得します...")
     df = fetch_daily_bars(target_code, from_date, to_date, api_key)
