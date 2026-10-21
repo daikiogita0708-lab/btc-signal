@@ -68,6 +68,7 @@ RESPONSE_COLUMN_MAP = {
 }
 
 _last_request_at = None  # 直前にリクエストを送った時刻(time.monotonic)
+_request_count = 0       # これまでに送ったAPIリクエストの回数(429の再試行も含む。ログでの動作確認用)
 
 
 def get_api_key() -> str:
@@ -106,7 +107,7 @@ def _throttled_get(url: str, params: dict, headers: dict) -> dict:
       同時に以後のリクエスト間隔も少し広げて、同じ失敗を繰り返さないようにする
     - それ以外のエラーは、APIが返した理由(message)つきの例外にする
     """
-    global _last_request_at, MIN_REQUEST_INTERVAL_SEC
+    global _last_request_at, _request_count, MIN_REQUEST_INTERVAL_SEC
     resp = None
     for attempt in range(MAX_RETRIES_ON_429 + 1):
         if time.monotonic() - _run_started_at > RUN_DEADLINE_SEC:
@@ -118,6 +119,7 @@ def _throttled_get(url: str, params: dict, headers: dict) -> dict:
 
         resp = requests.get(url, params=params, headers=headers, timeout=30)
         _last_request_at = time.monotonic()
+        _request_count += 1
 
         if resp.status_code != 429:
             if resp.status_code >= 400:
@@ -265,6 +267,11 @@ def fetch_master(api_key: str) -> pd.DataFrame:
 def latest_available_date() -> datetime:
     """プランのデータ遅延を考慮した『取得できる最新日』。"""
     return datetime.today() - timedelta(weeks=DELAY_WEEKS)
+
+
+def run_stats() -> tuple:
+    """(これまでのAPIリクエスト回数, 実行開始からの経過分)。ログで動作を確認するために使う。"""
+    return _request_count, (time.monotonic() - _run_started_at) / 60
 
 
 def main():

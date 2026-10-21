@@ -10,9 +10,12 @@ GitHub Actions(jquants_fetch.yml、平日朝の自動実行)から動く、
        上位候補はテクニカルで深掘りする → 毎日ちがう銘柄に出会える
     2. 「もし買うなら」の資金管理を自動計算。授業料予算と1回の損失上限から、
        損切りラインと最大株数を出す(=失敗しても致命傷にならない買い方)
-    3. 株専用のLINEチャネルに対応。Secretsに LINE_STOCK_CHANNEL_ACCESS_TOKEN を登録すると
-       BTCのLINEではなく株専用のLINEから届く(未登録なら今まで通りBTCのLINEから)
+    3. 株専用のLINEチャネルに対応。Secretsに LINE_STOCK_CHANNEL_ACCESS_TOKEN(または LINE_STOCK_TOKEN)を
+       登録すると、BTCのLINEではなく株専用のLINEから届く(未登録なら今まで通りBTCのLINEから)。
+       株専用チャネルへの送信に失敗した時は、BTCと共用のチャネルに切り替えて再送する(レポートを取りこぼさない)
     4. 吹き出しを5つに(サマリー / 市場スキャン / 仮想運用 / 銘柄別データ / 今日の学び)
+    5. ログを充実(データの最新日・市場スキャンの結果・API回数・吹き出しの文字数)。
+       LINEを開かなくても、Actionsのログだけで動作確認できるようにした
 
 ■ v4での変更点
     1. 仮想運用(ペーパートレード)を追加(paper_trading.py)。
@@ -53,7 +56,7 @@ GitHub Actions(jquants_fetch.yml、平日朝の自動実行)から動く、
 
 ■ 環境変数
     JQUANTS_API_KEY, LINE_CHANNEL_ACCESS_TOKEN, LINE_USER_ID
-    (任意) JQUANTS_DELAY_WEEKS, JQUANTS_MIN_INTERVAL_SEC
+    (任意) LINE_STOCK_CHANNEL_ACCESS_TOKEN, LINE_STOCK_USER_ID, JQUANTS_DELAY_WEEKS, JQUANTS_MIN_INTERVAL_SEC
 """
 
 import os
@@ -333,20 +336,34 @@ GLOSSARY_POOL = [
 
 def get_line_credentials() -> tuple[str, str]:
     """株専用チャネルのトークンがあればそれを使い、なければBTCと共用のトークンを使う。"""
-    token = os.environ.get("LINE_STOCK_CHANNEL_ACCESS_TOKEN") or os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-    user_id = os.environ.get("LINE_STOCK_USER_ID") or os.environ.get("LINE_USER_ID")
+    stock_token = os.environ.get("LINE_STOCK_CHANNEL_ACCESS_TOKEN")
+    stock_user = os.environ.get("LINE_STOCK_USER_ID")
+    token = stock_token or os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+    user_id = stock_user or os.environ.get("LINE_USER_ID")
     if not token or not user_id:
         sys.exit("エラー: LINEのチャネルアクセストークン または ユーザーID が設定されていません。")
-    channel = "株専用チャネル" if os.environ.get("LINE_STOCK_CHANNEL_ACCESS_TOKEN") else "BTCと共用のチャネル"
+    channel = "株専用チャネル" if stock_token else "BTCと共用のチャネル"
     print(f"[INFO] LINE送信先: {channel}")
+    if stock_token and not stock_user:
+        print("[INFO] 宛先のユーザーIDは LINE_USER_ID を使います"
+              "(株専用チャネルがBTCと同じLINEプロバイダ内なら、同じIDで届きます)")
     return token, user_id
+
+
+def get_fallback_line_credentials():
+    """株専用チャネルで送れなかった時の保険。BTCと共用チャネルの(トークン, ユーザーID)。使えなければ None。"""
+    if not os.environ.get("LINE_STOCK_CHANNEL_ACCESS_TOKEN"):
+        return None  # もともとBTCと共用で送っているので、保険は要らない
+    token, user_id = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN"), os.environ.get("LINE_USER_ID")
+    return (token, user_id) if token and user_id else None
 
 
 def send_line_messages(texts: list, token: str, user_id: str) -> bool:
     """最大5つの吹き出しを1回のPushでまとめて送る。"""
     bubbles = []
-    for t in texts[:5]:
+    for i, t in enumerate(texts[:5], 1):
         if len(t) > MAX_BUBBLE_LEN:
+            print(f"[WARN] {i}つ目の吹き出しが{len(t)}字で上限を超えたため、{MAX_BUBBLE_LEN}字で切り捨てます")
             t = t[:MAX_BUBBLE_LEN] + "\n…(以下省略)"
         bubbles.append({"type": "text", "text": t})
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -354,6 +371,27 @@ def send_line_messages(texts: list, token: str, user_id: str) -> bool:
     resp = requests.post(LINE_PUSH_URL, headers=headers, json=data, timeout=10)
     print(f"[DEBUG] LINE送信結果: {resp.status_code} {resp.text[:200]}")
     return resp.status_code == 200
+
+
+def send_with_fallback(texts: list, token: str, user_id: str) -> bool:
+    """通常の送信先に送り、失敗したら(株専用チャネルを使っている時だけ)BTC共用チャネルに切り替えて再送する。"""
+    try:
+        if send_line_messages(texts, token, user_id):
+            return True
+    except requests.RequestException as e:
+        print(f"[WARN] LINE送信中にエラーが起きました: {e}")
+    fallback = get_fallback_line_credentials()
+    if fallback is None:
+        return False
+    print("[WARN] 株専用チャネルに送れませんでした。BTCと共用のチャネルに切り替えて再送します"
+          "(株専用チャネルのトークン・宛先ID・友だち追加を確認してください)")
+    notice = "⚠️株専用のLINEに送れなかったため、こちらに届けています(GitHubのSecretsなどを確認してください)\n"
+    retry = [notice + texts[0]] + list(texts[1:])
+    try:
+        return send_line_messages(retry, fallback[0], fallback[1])
+    except requests.RequestException as e:
+        print(f"[WARN] BTC共用チャネルへの再送にも失敗しました: {e}")
+        return False
 
 
 # =====================================================================
@@ -739,6 +777,10 @@ def build_learning_bubble(results, breadth_pct, run_dt, paper=None) -> str:
 # =====================================================================
 
 def main():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # Actionsのログを、終わるのを待たず1行ずつ表示する
+    except (AttributeError, ValueError):
+        pass
     api_key = fetch_data.get_api_key()
     line_token, line_user_id = get_line_credentials()
     run_dt = datetime.now(JST)
@@ -764,10 +806,13 @@ def main():
                  f"原因(APIの返答): {LAST_FETCH_ERROR or '不明'}\n"
                  "GitHubの Actions タブでログを確認してください。")
         try:
-            send_line_messages([alert], line_token, line_user_id)
+            send_with_fallback([alert], line_token, line_user_id)
         except Exception as e:  # noqa: BLE001 - お知らせの送信失敗で、本来のエラー終了を隠さない
             print(f"[WARN] 失敗のお知らせをLINEに送れませんでした: {e}")
         sys.exit(1)  # Actions上で失敗(赤)として見えるようにする
+
+    latest = pd.Timestamp(max(df["Date"].max() for df in dfs.values())).date()
+    print(f"[INFO] 株価データの最新日: {latest}(実行日の{(run_dt.date() - latest).days}日前)")
 
     breadth_pct = sum(r["trend_up"] for r in results) / len(results) * 100
 
@@ -784,10 +829,15 @@ def main():
         print("市場スキャン中(東証プライム全体)...")
         scan = market_scan.run_market_scan(calendar, api_key)
         if scan:
-            for c in market_scan.deep_dive_candidates(scan, exclude=set(WATCHLIST)):
+            cands = market_scan.deep_dive_candidates(scan, exclude=set(WATCHLIST))
+            for c in cands:
                 out = analyze_one_stock(c["code"], c["name"], api_key)
                 if out is not None:
                     deep.append((c, out[0]))
+            print(f"[INFO] 市場スキャン結果: 基準日{scan['date']} / 売買代金の条件を満たす{scan['universe_size']}銘柄 / "
+                  f"深掘り{len(deep)}銘柄(候補{len(cands)}銘柄中)")
+        else:
+            print("[INFO] 市場スキャン結果: なし(営業日データが足りない、または売買代金の条件を満たす銘柄がありませんでした)")
     except Exception as e:  # noqa: BLE001 - スキャンの不具合でレポート全体を止めない
         print(f"[WARN] 市場スキャンに失敗しました: {e}")
         scan = None
@@ -799,7 +849,11 @@ def main():
         build_detail_bubble(results),
         build_learning_bubble(results, breadth_pct, run_dt, paper),
     ]
-    sent = send_line_messages(bubbles, line_token, line_user_id)
+    print("[INFO] 吹き出しの文字数: " + " / ".join(str(len(b)) for b in bubbles)
+          + f"(LINEの上限は1つ5000字。{MAX_BUBBLE_LEN}字を超えた分は切り捨て)")
+    sent = send_with_fallback(bubbles, line_token, line_user_id)
+    n_requests, minutes = fetch_data.run_stats()
+    print(f"[INFO] J-Quants APIのリクエスト数: {n_requests}回(429の再試行を含む) / 実行開始からの所要時間: {minutes:.1f}分")
     print("LINEへの送信に成功しました！" if sent else "LINE送信に失敗しました。上のDEBUG行を確認してください。")
     if not sent:
         sys.exit(1)
