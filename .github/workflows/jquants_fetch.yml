@@ -10,6 +10,9 @@ on:
 jobs:
   fetch-and-analyze:
     runs-on: ubuntu-latest
+    # Freeプランは1分5回の制限なので、監視10銘柄+市場スキャンで約36リクエスト≒8分かかる。
+    # 429(制限超過)で待つ分の余裕も見て25分。万一の暴走防止も兼ねる。
+    timeout-minutes: 25
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -26,7 +29,26 @@ jobs:
 
       - name: Run analysis script
         env:
-          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+
+          # ── 株専用のLINE(推奨) ──
+          # 設定すると株の通知はこちらのチャネルに届く(BTC用とは別のトーク)。
+          # 未設定ならBTCと共用の下2つにフォールバックする。
+          LINE_STOCK_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_STOCK_CHANNEL_ACCESS_TOKEN }}
+          LINE_STOCK_USER_ID: ${{ secrets.LINE_STOCK_USER_ID }}
+
+          # ── BTCと共用(フォールバック) ──
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+
+          # ── 授業料予算(Settings > Secrets and variables > Actions > Variables で変更可。コード修正不要) ──
+          # TUITION_BUDGET_YEN    : 全部失ってもいいと思える額。「もし買うなら」の株数計算の元になる(既定10万円)
+          # MAX_LOSS_PCT_PER_TRADE: 1回の取引で失ってよい割合(予算に対する%。既定5%)
+          TUITION_BUDGET_YEN: ${{ vars.TUITION_BUDGET_YEN || '100000' }}
+          MAX_LOSS_PCT_PER_TRADE: ${{ vars.MAX_LOSS_PCT_PER_TRADE || '5' }}
+
+          # ── 有料プランに切り替えたら、Variablesに下の2つを登録するだけでよい(コード変更不要) ──
+          # JQUANTS_DELAY_WEEKS=0 / JQUANTS_MIN_INTERVAL_SEC=1.1
+          JQUANTS_DELAY_WEEKS: ${{ vars.JQUANTS_DELAY_WEEKS || '12' }}
+          JQUANTS_MIN_INTERVAL_SEC: ${{ vars.JQUANTS_MIN_INTERVAL_SEC || '13' }}
         run: python analyze_jquants.py
