@@ -2,8 +2,8 @@
 """
 daily_report.py — BTC 日次レポート（1日1回、LINEへ送信）
 ======================================================================
-その時点の判定（買い時／静観／危険／収集中）・理由・金額の目安パターンを
-「毎日必ず」LINEに届けます。bot.py（15分ごとの買い時アラート）とは別の、
+その時点の判定（買い時／静観／危険／収集中）・理由・金額の目安を
+「毎日必ず」LINEに届けます。bot.py（買い時アラート）とは別の、
 独立したワークフローから実行される想定です。
 
 ■ このスクリプトも実際の注文は一切送りません（アラート専用）。
@@ -16,28 +16,30 @@ from bot import (
     BitflyerAPIError,
     BitflyerClient,
     DEFAULT_MODE,
+    LOOKBACK_HOURS,
     MODES,
     PRODUCT_CODE,
     ZONE_STYLE,
     evaluate,
-    fetch_balance_line,
-    format_amount_patterns,
+    fetch_balances,
+    format_amount_section,
+    format_balance_line,
     load_store,
     notify_all,
 )
 
 
-def build_report_message(result, price, balance_line=""):
+def build_report_message(result, price, jpy, btc, sample_count):
     price_text = f"{price:,.0f}円" if price is not None else "取得できませんでした"
     return (
         f"📊 本日のBTCレポート（{result['mode_label']}）\n"
         f"判定: {result['emoji']} {result['title']}\n"
         f"現在価格: {price_text}\n"
-        f"理由: {result['reason']}\n\n"
-        f"買うなら金額の目安（ご自身でアプリから）:\n"
-        f"{format_amount_patterns()}"
-        f"{balance_line}\n\n"
-        f"※これは判断材料です。買う／買わないはご自身で決めてください。自動購入はしません。"
+        f"理由: {result['reason']}\n"
+        f"（判定に使った価格データ: 直近{LOOKBACK_HOURS:.0f}時間で{sample_count}件）\n\n"
+        f"{format_amount_section(result, jpy)}"
+        f"{format_balance_line(jpy, btc)}\n\n"
+        f"※過去の平均との比較による目安で、儲かる保証はありません。自動購入もしません。買う／買わないはご自身で決めてください。"
     )
 
 
@@ -58,7 +60,8 @@ def main():
     except (BitflyerAPIError, KeyError, ValueError, TypeError) as e:
         print(f"[WARN] price_fetch_failed type={type(e).__name__}")
 
-    history_tuples = [(t, p) for [t, p] in store.get("history", [])]
+    cutoff = now - LOOKBACK_HOURS * 3600
+    history_tuples = [(t, p) for [t, p] in store.get("history", []) if t >= cutoff]
 
     if price is not None:
         result = evaluate(price, now, history_tuples, mode_key)
@@ -70,8 +73,8 @@ def main():
             "baseline_avg": None, **style,
         }
 
-    balance_line = fetch_balance_line(client)
-    message = build_report_message(result, price, balance_line)
+    jpy, btc = fetch_balances(client)
+    message = build_report_message(result, price, jpy, btc, len(history_tuples))
 
     # 日次レポートは判定にかかわらず「毎回必ず」送る
     sent = notify_all(message)

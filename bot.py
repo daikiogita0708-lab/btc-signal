@@ -25,7 +25,36 @@ import requests
 DEFAULT_MODE = "aggressive"          # 意味のある攻めモード（押し目を敏感に狙う）
 PRODUCT_CODE = "BTC_JPY"
 NOTIFY_COOLDOWN_SECONDS = 60 * 60    # アラートの最短間隔（1時間）
-AMOUNT_PATTERNS_JPY = [1000, 3000, 5000]   # 通知に添える「金額の目安」パターン（固定3パターン）
+
+# ---- 金額の目安（状況に合わせて変える）----
+# 「円残高に対する割合」を、下落幅(押し目の深さ)とゾーンで変える。(控えめ, 標準, 攻め)
+AMOUNT_LABELS = ("控えめ", "標準", "攻め")
+AMOUNT_RATIOS = {
+    "buy_small":  (0.05, 0.10, 0.20),   # 下落が-1%台（小さめの押し目）
+    "buy_medium": (0.10, 0.20, 0.35),   # 下落が-2%台〜-4%手前
+    "buy_large":  (0.15, 0.30, 0.50),   # 下落が-4%以上（大きな下落）
+    "watch":      (0.02, 0.05, 0.10),   # 静観ゾーン（見送りが基本）
+    "danger":     (0.01, 0.02, 0.03),   # 危険ゾーン（高値圏。見送り推奨）
+}
+# 円残高が取得できなかった時だけ使う固定額（円）
+AMOUNT_FALLBACK_JPY = {
+    "buy_small":  (1000, 2000, 3000),
+    "buy_medium": (2000, 3000, 5000),
+    "buy_large":  (3000, 5000, 8000),
+    "watch":      (500, 1000, 2000),
+    "danger":     (500, 1000, 1500),
+}
+TIER_TEXT = {
+    "buy_small": "小さめの押し目",
+    "buy_medium": "中くらいの押し目",
+    "buy_large": "大きめの下落",
+}
+MAX_RATIO_OF_BALANCE = 0.5   # 1回の提案額は円残高の半分まで
+ROUND_UNIT_JPY = 100         # 提案額は100円単位に丸める
+
+# ---- 買い時アラートの出し方（通知を増やしすぎないためのルール）----
+MAX_ALERTS_PER_DAY = 2       # 1日(日本時間)に送る買い時アラートの上限
+FOLLOWUP_DROP_PCT = 1.5      # 同じ下落局面で「続報」を送る条件: 前回通知の価格から、さらにこの%以上下がった時
 
 STORE_PATH = Path("state/store.json")
 OUTPUT_DIR = Path("public")
@@ -213,24 +242,107 @@ def notify_all(message):
     return send_line(message)
 
 
-def format_amount_patterns(patterns=None):
-    patterns = patterns or AMOUNT_PATTERNS_JPY
-    return "\n".join(f"・{p:,}円" for p in patterns)
-
-
-def fetch_balance_line(client):
-    """残高を取得して通知用の1行を作る。失敗時は空文字（通知自体は止めない）。"""
+def fetch_balances(client):
+    """(円残高, BTC残高) を返す。取れなかったら (None, None)。
+    失敗しても通知は止めない。失敗理由の種類だけログに残す（金額・鍵は出さない）。"""
     if not client.has_credentials():
-        return ""
+        print("[WARN] balance_skipped reason=no_credentials")
+        return None, None
     try:
         balances = client.get_balance()
-        jpy = next((b["available"] for b in balances if b.get("currency_code") == "JPY"), None)
-        btc = next((b["available"] for b in balances if b.get("currency_code") == "BTC"), None)
-        if jpy is not None and btc is not None:
-            return f"\n残高目安: {jpy:,.0f}円 / {btc:.8f} BTC"
-    except BitflyerAPIError:
-        pass
-    return ""
+    except BitflyerAPIError as e:
+        print(f"[WARN] balance_fetch_failed reason={e}")
+        return None, None
+    try:
+        jpy = next((float(b["available"]) for b in balances if b.get("currency_code") == "JPY"), None)
+        btc = next((float(b["available"]) for b in balances if b.get("currency_code") == "BTC"), None)
+    except (AttributeError, TypeError, KeyError, ValueError):
+        print("[WARN] balance_parse_failed")
+        return None, None
+    if jpy is None:
+        print("[WARN] balance_parse_failed reason=no_jpy_entry")
+    return jpy, btc
+
+
+def format_balance_line(jpy, btc):
+    if jpy is None:
+        return ""
+    btc_text = f" / {btc:.8f} BTC" if btc is not None else ""
+    return f"\n残高目安: {jpy:,.0f}円{btc_text}"
+
+
+def amount_tier(result):
+    """判定結果から、金額の目安の区分を決める。判定不能なら None。"""
+    zone = result.get("zone")
+    dev = result.get("deviation_pct")
+    if zone == "buy" and dev is not None:
+        if dev <= -4.0:
+            return "buy_large"
+        if dev <= -2.0:
+            return "buy_medium"
+        return "buy_small"
+    if zone in ("watch", "danger"):
+        return zone
+    return None
+
+
+def suggest_amounts(result, balance_jpy=None):
+    """状況（ゾーン・下落幅）と円残高に合わせて、金額の目安を最大3つ返す。
+    戻り値: {"tier", "basis"("balance"|"fixed"|"no_balance"), "items":[(ラベル, 円, 割合or None)]} / 判定不能なら None"""
+    tier = amount_tier(result)
+    if tier is None:
+        return None
+
+    if balance_jpy is None:
+        raw = [(lab, amt, None) for lab, amt in zip(AMOUNT_LABELS, AMOUNT_FALLBACK_JPY[tier])]
+        basis = "fixed"
+    elif balance_jpy < ROUND_UNIT_JPY:
+        return {"tier": tier, "basis": "no_balance", "items": []}
+    else:
+        cap = int(balance_jpy * MAX_RATIO_OF_BALANCE // ROUND_UNIT_JPY) * ROUND_UNIT_JPY
+        raw = []
+        for lab, ratio in zip(AMOUNT_LABELS, AMOUNT_RATIOS[tier]):
+            amt = int(balance_jpy * ratio / ROUND_UNIT_JPY + 0.5) * ROUND_UNIT_JPY
+            amt = max(ROUND_UNIT_JPY, min(amt, cap)) if cap >= ROUND_UNIT_JPY else ROUND_UNIT_JPY
+            if amt <= balance_jpy:
+                raw.append((lab, amt, ratio))
+        basis = "balance"
+
+    items, seen = [], set()
+    for lab, amt, ratio in raw:      # 同額が並んだら1つにまとめる
+        if amt not in seen:
+            seen.add(amt)
+            items.append((lab, amt, ratio))
+    return {"tier": tier, "basis": basis, "items": items}
+
+
+def format_amount_section(result, balance_jpy=None):
+    """通知に添える「金額の目安」ブロック（末尾に改行なし）。"""
+    s = suggest_amounts(result, balance_jpy)
+    if s is None:
+        return "金額の目安: 判定できていないため、今回は提案なし"
+
+    zone = result["zone"]
+    if zone == "buy":
+        dev = result.get("deviation_pct")
+        head = f"買うなら金額の目安（ご自身でアプリから）\n  下落幅 {abs(dev):.1f}%＝{TIER_TEXT[s['tier']]}の想定"
+    elif zone == "watch":
+        head = "見送りが基本。それでも買うなら少額で"
+    else:
+        head = "高値圏なので見送り推奨。どうしても買うなら最少額で"
+
+    if s["basis"] == "no_balance":
+        return f"{head}\n・円の残高がほぼ無いため、提案できる額がありません"
+
+    lines = []
+    for lab, amt, ratio in s["items"]:
+        pct = f"（残高の{ratio * 100:.0f}%）" if ratio is not None else ""
+        lines.append(f"・{lab}: {amt:,}円{pct}")
+    if s["basis"] == "balance":
+        foot = "※円残高に対する割合で計算。1回の提案は残高の半分までに抑えています"
+    else:
+        foot = "※円残高が取れていないため固定の目安額です。実際の残高を超えないように"
+    return head + "\n" + "\n".join(lines) + "\n" + foot
 
 
 # ============================================================
@@ -244,10 +356,14 @@ def load_store():
             data.setdefault("history", [])
             data.setdefault("last_zone", None)
             data.setdefault("last_notified_at", 0.0)
+            data.setdefault("last_alert_price", None)   # 最後にアラートを送った時の価格
+            data.setdefault("alert_day", None)          # 上限カウント用の日付(日本時間)
+            data.setdefault("alerts_today", 0)          # その日に送ったアラート数
             return data
     except (json.JSONDecodeError, OSError, TypeError):
         pass
-    return {"history": [], "last_zone": None, "last_notified_at": 0.0}
+    return {"history": [], "last_zone": None, "last_notified_at": 0.0,
+            "last_alert_price": None, "alert_day": None, "alerts_today": 0}
 
 
 def save_store(data):
@@ -298,6 +414,60 @@ def render_html(result, price, updated_at_str, mode_label):
 
 
 # ============================================================
+# 買い時アラートを送るかどうかの判定
+# ============================================================
+def jst_date_str(ts):
+    return time.strftime("%Y-%m-%d", time.gmtime(ts + 9 * 3600))
+
+
+def alerts_sent_today(store, now):
+    """今日(日本時間)にすでに送ったアラート数。日付が変わっていれば0。"""
+    return store.get("alerts_today", 0) if store.get("alert_day") == jst_date_str(now) else 0
+
+
+def decide_alert(store, price, now):
+    """買い時ゾーンのとき、アラートを送るか決める。
+    戻り値: (送るか, 種別 "first"|"followup"|None, ログ用の理由)
+      first    … 買い時ゾーンに入った最初の通知
+      followup … 同じ下落局面で、前回通知からさらに FOLLOWUP_DROP_PCT% 以上下がった時の続報
+    """
+    if alerts_sent_today(store, now) >= MAX_ALERTS_PER_DAY:
+        return False, None, "daily_cap"
+    if now - store.get("last_notified_at", 0.0) < NOTIFY_COOLDOWN_SECONDS:
+        return False, None, "cooldown"
+    if store.get("last_zone") != "buy":
+        return True, "first", "new_episode"
+    base = store.get("last_alert_price")
+    if not base or base <= 0:
+        return False, None, "no_baseline"
+    drop_pct = (base - price) / base * 100.0
+    if drop_pct >= FOLLOWUP_DROP_PCT:
+        return True, "followup", "further_drop"
+    return False, None, "no_further_drop"
+
+
+def build_alert_message(result, price, kind, jpy, btc, nth, prev_price=None):
+    if kind == "followup" and prev_price:
+        drop = (prev_price - price) / prev_price * 100.0
+        head = (
+            f"🟢 買い時シグナル・続報（{result['mode_label']}）\n"
+            f"前回の通知（{prev_price:,.0f}円）からさらに{drop:.1f}%下落しました。\n"
+            f"※下落が続いている局面です。このあとさらに下がる可能性もあります。\n"
+        )
+    else:
+        head = f"🟢 買い時シグナル！（{result['mode_label']}）\n"
+    return (
+        f"{head}"
+        f"現在価格: {price:,.0f}円\n"
+        f"理由: {result['reason']}\n\n"
+        f"{format_amount_section(result, jpy)}"
+        f"{format_balance_line(jpy, btc)}\n\n"
+        f"（本日{nth}通目／上限{MAX_ALERTS_PER_DAY}通）\n"
+        f"※過去の平均との比較による目安で、儲かる保証はありません。自動購入もしません。最終判断はお任せします。"
+    )
+
+
+# ============================================================
 # メイン処理
 # ============================================================
 def main():
@@ -337,27 +507,33 @@ def main():
         }
 
     # 「買い時ゾーン」になった時だけアラート通知（発注は一切しない）
+    alert_failed = False
     if result["zone"] == "buy":
-        last_zone = store.get("last_zone")
-        is_transition = last_zone != "buy"
-        cooldown_ok = (now - store.get("last_notified_at", 0.0)) >= NOTIFY_COOLDOWN_SECONDS
-
-        if is_transition or cooldown_ok:
-            balance_line = fetch_balance_line(client)
-            message = (
-                f"🟢 買い時シグナル！（{result['mode_label']}）\n"
-                f"現在価格: {price:,.0f}円\n"
-                f"理由: {result['reason']}\n\n"
-                f"買うなら金額の目安（ご自身でアプリから）:\n"
-                f"{format_amount_patterns()}"
-                f"{balance_line}\n\n"
-                f"※自動購入はしません。最終判断はお任せします。"
-            )
+        should_send, kind, why = decide_alert(store, price, now)
+        if not should_send:
+            print(f"[INFO] alert_skipped reason={why}")
+            if why == "no_baseline":
+                # 以前の状態(続報の基準価格なし)から引き継いだ場合は、今の価格を基準にする
+                store["last_alert_price"] = price
+        else:
+            nth = alerts_sent_today(store, now) + 1
+            prev_price = store.get("last_alert_price")
+            jpy, btc = fetch_balances(client)
+            message = build_alert_message(result, price, kind, jpy, btc, nth, prev_price)
             sent = notify_all(message)
-            store["last_notified_at"] = now
-            print(f"[INFO] alert_sent zone=buy transition={is_transition} sent={sent}")
+            print(f"[INFO] alert kind={kind} nth_today={nth} sent={sent}")
+            if sent:
+                # 送れた時だけ記録する（送信に失敗した時は、上限を消費せず次回また試す）
+                store["last_notified_at"] = now
+                store["last_alert_price"] = price
+                store["alert_day"] = jst_date_str(now)
+                store["alerts_today"] = nth
+            else:
+                alert_failed = True
 
-    store["last_zone"] = result["zone"]
+    # 送信に失敗した時は「買い時ゾーンに入った」ことを記録しない（次回また最初の通知として試す）
+    if not alert_failed:
+        store["last_zone"] = result["zone"]
     save_store(store)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
