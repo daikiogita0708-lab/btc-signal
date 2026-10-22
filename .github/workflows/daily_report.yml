@@ -2,9 +2,10 @@ name: bitcoin-daily-report
 
 on:
   schedule:
-    # 毎日 08:00 JST に実行(cronはUTC基準。23:00 UTC(前日)= 08:00 JST)
+    # 毎朝 07:53 JST ごろに実行(cronはUTC基準。22:53 UTC(前日)= 07:53 JST)
+    # 毎時0分ちょうどは混みやすいので、少しずらしている
     # ※GitHub Actionsのscheduleは混雑状況で数分〜数十分遅れることがある
-    - cron: '0 23 * * *'
+    - cron: '53 22 * * *'
   workflow_dispatch:
 
 jobs:

@@ -2,7 +2,9 @@ name: bitcoin-signal-check
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    # 15分おき。ただし毎時0分前後はGitHub側が混んで実行が遅れたり飛ばされたりしやすいため、
+    # 7・22・37・52分にずらしている（それでも実行時刻の保証はない）
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
 
 concurrency:
