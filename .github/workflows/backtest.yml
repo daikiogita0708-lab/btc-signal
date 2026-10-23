@@ -1,0 +1,40 @@
+name: bitcoin-backtest
+
+# 買い時ルールを過去の値動きで試す「検証専用」ワークフロー。
+# ・手動実行のみ（自動では動きません）
+# ・LINEは送らず、Secretsも使わず、注文も出さず、リポジトリへの書き込みもしません
+# ・結果は、実行画面の「Summary」と、ログに表示されます
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: '何年ぶん試すか（1〜8）'
+        required: false
+        default: '4'
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run backtest (read-only)
+        env:
+          YEARS: ${{ github.event.inputs.years || '4' }}
+          PYTHONUNBUFFERED: '1'
+        run: python backtest.py --years "$YEARS"
