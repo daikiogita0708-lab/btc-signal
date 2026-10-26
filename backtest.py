@@ -492,7 +492,9 @@ def render_scenario(title, res):
     f = res["freq"]
     L += [
         "### ① 通知の頻度",
-        f"- 買い時通知は合計 **{f['total']}通**（最初の通知 {f['first']}通＋続報 {f['followup']}通）",
+        (f"- 買い時通知は合計 **{f['total']}通**（最初の通知 {f['first']}通＋続報 {f['followup']}通）"
+         if bot.FOLLOWUP_ENABLED else
+         f"- 買い時通知は合計 **{f['total']}通**（続報は停止中なので、すべて「最初の通知」）"),
         f"- 月平均 **{f['per_month_avg']:.1f}通**／一番多かった月は {f['per_month_max']}通" if f["per_month_avg"] is not None else "- 月平均: —",
         f"- 通知が1通以上あった日: {f['days_with_alert']}日／{f['days_total']}日（1日の上限{bot.MAX_ALERTS_PER_DAY}通に達した日: {f['days_with_cap']}日）",
         "- 時間の使い方: " + "／".join(
@@ -510,16 +512,17 @@ def render_scenario(title, res):
         L.append(f"| {h}日後 | {am} | {amed} | {aw} | {an} | {pct(b['mean']) if b else '—'} | {pct_plain(b['win']) if b else '—'} |")
     L += ["", "※「いつ買っても」＝全部の時点で買った場合の平均（基準）。通知の方がこれより良ければ、ルールに意味がある可能性があります。", ""]
 
-    L += ["#### 通知の種類別（最初の通知／続報＝前回通知からさらに下がった時）",
-          "| 種類 | 件数 | 7日後の平均 | 7日後プラス割合 | 30日後の平均 | 30日後プラス割合 |",
-          "|---|---|---|---|---|---|"]
-    for label, kind in (("最初の通知", "first"), ("続報", "followup")):
-        s7, s30 = res["alert_stats"][kind][7], res["alert_stats"][kind][30]
-        L.append(
-            f"| {label} | {f['first'] if kind == 'first' else f['followup']:,} | "
-            f"{pct(s7['mean']) if s7 else '—'} | {pct_plain(s7['win']) if s7 else '—'} | "
-            f"{pct(s30['mean']) if s30 else '—'} | {pct_plain(s30['win']) if s30 else '—'} |")
-    L.append("")
+    if bot.FOLLOWUP_ENABLED:      # 続報を止めている間は「種類別」に意味がない（全部が最初の通知）ので出さない
+        L += ["#### 通知の種類別（最初の通知／続報＝前回通知からさらに下がった時）",
+              "| 種類 | 件数 | 7日後の平均 | 7日後プラス割合 | 30日後の平均 | 30日後プラス割合 |",
+              "|---|---|---|---|---|---|"]
+        for label, kind in (("最初の通知", "first"), ("続報", "followup")):
+            s7, s30 = res["alert_stats"][kind][7], res["alert_stats"][kind][30]
+            L.append(
+                f"| {label} | {f['first'] if kind == 'first' else f['followup']:,} | "
+                f"{pct(s7['mean']) if s7 else '—'} | {pct_plain(s7['win']) if s7 else '—'} | "
+                f"{pct(s30['mean']) if s30 else '—'} | {pct_plain(s30['win']) if s30 else '—'} |")
+        L.append("")
 
     r = res["risk"]
     L.append("### ③ 外れパターン: 通知のあとの7日間で、さらに下がった／上がった幅")
@@ -655,7 +658,8 @@ def render_report(meta, ideal, sparse_runs, nulls=None):
         f"- 判定ルール: 本番botと同じ関数。直近{bot.LOOKBACK_HOURS:.0f}時間の平均より{abs(bot.MODES[bot.DEFAULT_MODE]['buy_threshold_pct']):.1f}%以上安い→買い時／"
         f"{bot.MODES[bot.DEFAULT_MODE]['danger_threshold_pct']:.1f}%以上高い→危険／その間は静観",
         f"- 通知ルール: 本番botと同じ関数。1日{bot.MAX_ALERTS_PER_DAY}通まで・最短{bot.NOTIFY_COOLDOWN_SECONDS // 60}分おき・"
-        f"続報は前回通知価格からさらに{bot.FOLLOWUP_DROP_PCT:.1f}%以上下がった時だけ",
+        + (f"続報は前回通知価格からさらに{bot.FOLLOWUP_DROP_PCT:.1f}%以上下がった時だけ" if bot.FOLLOWUP_ENABLED
+           else "続報は出さない（同じ下落局面が続く間は、さらに下がっても通知しない）"),
         "- 含まれないもの: 販売所のスプレッドや手数料／通知が届いてから実際に買うまでの遅れ／手持ちの円残高の制約／税金",
         "- 2つの見られ方で試しました: A=15分ごとに必ず価格を見られた場合（理想）／B=GitHubの自動実行が遅れて1〜5.5時間おきにしか見られない場合（実際に近い）",
         "",
@@ -668,7 +672,7 @@ def render_report(meta, ideal, sparse_runs, nulls=None):
         L += render_null(key_metrics(ideal), nulls)
     L += [
         "## 読み方の注意",
-        "- 同じ下落局面の中で通知が何通も出るため、通知の件数は「独立した当たり外れの回数」ではありません。",
+        "- 同じ下落の流れの中で（近い日に）通知が何通も出ることがあるため、通知の件数は「独立した当たり外れの回数」ではありません。",
         "- 検証した期間の相場（上げ・下げの流れ）に結果が大きく左右されます。年ごとの表で、効いた年・効かなかった年を確認してください。",
         "- しきい値（1%など）を後から探して「当たって見える」値に合わせると、将来は当たりません。本番のルールそのものの結果だけを見ています。",
         "- 押し目を待つやり方は、待っている間に相場が上がり続けると取り逃がします。この表は「買った1回ごとの得失」を見ていて、買わずに待っていた間の取り逃がしは含みません。",

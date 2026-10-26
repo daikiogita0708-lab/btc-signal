@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-bot.py — ビットコイン買い時アラート（クラウド版 / GitHub Actions用）
+bot.py — ビットコイン「平均より安め」お知らせ（クラウド版 / GitHub Actions用）
 ======================================================================
-15分ごとに価格をチェックし、一時的な下落（押し目）を捉えたら
-LINEに「買い時かも」とお知らせします。
+15分ごとに価格をチェックし、直近の平均より安めの水準（一時的な下落）になったら
+LINEに「平均より安め（目安）」とお知らせします。
+（過去の検証では、このタイミングで買っても有利とは言えませんでした。あくまで目安です）
 
 ■ このbotは実際の注文は一切送りません（アラート専用）。
   買う/買わないの最終判断は、必ずご自身でbitFlyerアプリから行ってください。
@@ -45,16 +46,25 @@ AMOUNT_FALLBACK_JPY = {
     "danger":     (500, 1000, 1500),
 }
 TIER_TEXT = {
-    "buy_small": "小さめの押し目",
-    "buy_medium": "中くらいの押し目",
+    "buy_small": "小さめの値下がり",
+    "buy_medium": "中くらいの値下がり",
     "buy_large": "大きめの下落",
 }
 MAX_RATIO_OF_BALANCE = 0.5   # 1回の提案額は円残高の半分まで
 ROUND_UNIT_JPY = 100         # 提案額は100円単位に丸める
 
-# ---- 買い時アラートの出し方（通知を増やしすぎないためのルール）----
-MAX_ALERTS_PER_DAY = 2       # 1日(日本時間)に送る買い時アラートの上限
-FOLLOWUP_DROP_PCT = 1.5      # 同じ下落局面で「続報」を送る条件: 前回通知の価格から、さらにこの%以上下がった時
+# ---- 「平均より安め」アラートの出し方（通知を増やしすぎないためのルール）----
+# 過去8年の検証（backtest.py）で、続報には追加の価値が見られず、通知の頻度も多めだったため、
+# 続報を止め、1日の上限を 2通→1通 にしました。
+MAX_ALERTS_PER_DAY = 1       # 1日(日本時間)に送るアラートの上限
+FOLLOWUP_ENABLED = False     # 同じ下落局面での「続報」。False=送らない（True にすると以前の動きに戻る）
+FOLLOWUP_DROP_PCT = 1.5      # 続報を送る条件（FOLLOWUP_ENABLED=True の時だけ使う）: 前回通知の価格から、さらにこの%以上下がった時
+
+# 通知の末尾に添える、検証結果の一言（「買い時」と受け取られすぎないようにするため）
+VERIFICATION_NOTE = (
+    "※過去約8年の検証では、この目安で買っても、適当な日に買うより有利とは言えませんでした。"
+    "通知のあと7日以内に3%以上さらに下がることも、約半分ありました。"
+)
 
 STORE_PATH = Path("state/store.json")
 OUTPUT_DIR = Path("public")
@@ -87,7 +97,7 @@ MIN_SPAN_HOURS = 1.0
 LOOKBACK_HOURS = 24.0
 
 ZONE_STYLE = {
-    "buy": {"emoji": "🟢", "title": "買い時ゾーン", "bg": "#2ecc71", "fg": "#0b3d20"},
+    "buy": {"emoji": "🟢", "title": "平均より安め（目安）", "bg": "#2ecc71", "fg": "#0b3d20"},
     "watch": {"emoji": "🟡", "title": "静観ゾーン", "bg": "#f5c518", "fg": "#4a3800"},
     "danger": {"emoji": "🔴", "title": "危険ゾーン", "bg": "#e74c3c", "fg": "#ffffff"},
     "collecting": {"emoji": "⏳", "title": "データ収集中", "bg": "#95a5a6", "fg": "#ffffff"},
@@ -96,7 +106,7 @@ ZONE_STYLE = {
 
 
 def evaluate(current_price, current_time, history, mode_key=DEFAULT_MODE):
-    """現在価格を、過去の履歴の平均と比べて「買い時／静観／危険」を判定する。"""
+    """現在価格を、過去の履歴の平均と比べて「平均より安め(buy)／静観(watch)／危険(danger)」を判定する。"""
     mode = MODES.get(mode_key, MODES[DEFAULT_MODE])
     past_points = [p for (t, p) in history if t < current_time]
 
@@ -122,7 +132,7 @@ def evaluate(current_price, current_time, history, mode_key=DEFAULT_MODE):
     if deviation_pct <= mode["buy_threshold_pct"]:
         zone = "buy"
         reason = (
-            f"直近平均（{baseline_avg:,.0f}円）より{abs(deviation_pct):.1f}%値下がりした「押し目」を検知しました。"
+            f"直近平均（{baseline_avg:,.0f}円）より{abs(deviation_pct):.1f}%安い水準です。"
         )
     elif deviation_pct >= mode["danger_threshold_pct"]:
         zone = "danger"
@@ -382,7 +392,7 @@ def render_html(result, price, updated_at_str, mode_label):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="120">
-<title>ビットコイン買い時アラート（攻めモード）</title>
+<title>ビットコイン価格チェック（攻めモード）</title>
 <style>
   body {{ margin: 0; padding: 24px 16px; background: #f4f5f7; font-family: sans-serif; color: #1a1a1a; }}
   .card {{ max-width: 480px; margin: 0 auto; background: {bg}; color: {fg}; border-radius: 16px; padding: 28px 20px; text-align: center; }}
@@ -414,7 +424,7 @@ def render_html(result, price, updated_at_str, mode_label):
 
 
 # ============================================================
-# 買い時アラートを送るかどうかの判定
+# 「平均より安め」アラートを送るかどうかの判定
 # ============================================================
 def jst_date_str(ts):
     return time.strftime("%Y-%m-%d", time.gmtime(ts + 9 * 3600))
@@ -426,10 +436,13 @@ def alerts_sent_today(store, now):
 
 
 def decide_alert(store, price, now):
-    """買い時ゾーンのとき、アラートを送るか決める。
+    """「平均より安め(buy)」ゾーンのとき、アラートを送るか決める。
     戻り値: (送るか, 種別 "first"|"followup"|None, ログ用の理由)
-      first    … 買い時ゾーンに入った最初の通知
-      followup … 同じ下落局面で、前回通知からさらに FOLLOWUP_DROP_PCT% 以上下がった時の続報
+      first    … 平均より安めのゾーンに入った最初の通知
+      followup … （FOLLOWUP_ENABLED=True の時だけ）同じ下落局面で、前回通知からさらに
+                 FOLLOWUP_DROP_PCT% 以上下がった時の続報
+    FOLLOWUP_ENABLED=False（現在の設定）では、同じ局面が続いている間は、さらに下がっても送らない
+    （理由 same_episode）。ゾーンをいったん離れて入り直した時は、あらためて「最初の通知」になる。
     """
     if alerts_sent_today(store, now) >= MAX_ALERTS_PER_DAY:
         return False, None, "daily_cap"
@@ -437,6 +450,8 @@ def decide_alert(store, price, now):
         return False, None, "cooldown"
     if store.get("last_zone") != "buy":
         return True, "first", "new_episode"
+    if not FOLLOWUP_ENABLED:
+        return False, None, "same_episode"
     base = store.get("last_alert_price")
     if not base or base <= 0:
         return False, None, "no_baseline"
@@ -450,12 +465,12 @@ def build_alert_message(result, price, kind, jpy, btc, nth, prev_price=None):
     if kind == "followup" and prev_price:
         drop = (prev_price - price) / prev_price * 100.0
         head = (
-            f"🟢 買い時シグナル・続報（{result['mode_label']}）\n"
+            f"🟢 平均より安め（目安）・続報｜{result['mode_label']}\n"
             f"前回の通知（{prev_price:,.0f}円）からさらに{drop:.1f}%下落しました。\n"
             f"※下落が続いている局面です。このあとさらに下がる可能性もあります。\n"
         )
     else:
-        head = f"🟢 買い時シグナル！（{result['mode_label']}）\n"
+        head = f"🟢 平均より安め（目安）｜{result['mode_label']}\n"
     return (
         f"{head}"
         f"現在価格: {price:,.0f}円\n"
@@ -463,7 +478,8 @@ def build_alert_message(result, price, kind, jpy, btc, nth, prev_price=None):
         f"{format_amount_section(result, jpy)}"
         f"{format_balance_line(jpy, btc)}\n\n"
         f"（本日{nth}通目／上限{MAX_ALERTS_PER_DAY}通）\n"
-        f"※過去の平均との比較による目安で、儲かる保証はありません。自動購入もしません。最終判断はお任せします。"
+        f"{VERIFICATION_NOTE}\n"
+        f"※「直近平均より安い」というだけの目安で、儲かる保証はありません。自動購入もしません。最終判断はお任せします。"
     )
 
 
@@ -506,14 +522,14 @@ def main():
             "mode_label": MODES[mode_key]["label"], "deviation_pct": None, "baseline_avg": None, **style,
         }
 
-    # 「買い時ゾーン」になった時だけアラート通知（発注は一切しない）
+    # 「平均より安め」ゾーンになった時だけアラート通知（発注は一切しない）
     alert_failed = False
     if result["zone"] == "buy":
         should_send, kind, why = decide_alert(store, price, now)
         if not should_send:
             print(f"[INFO] alert_skipped reason={why}")
             if why == "no_baseline":
-                # 以前の状態(続報の基準価格なし)から引き継いだ場合は、今の価格を基準にする
+                # （続報が有効な時だけ起こる）以前の状態(続報の基準価格なし)から引き継いだ場合は、今の価格を基準にする
                 store["last_alert_price"] = price
         else:
             nth = alerts_sent_today(store, now) + 1
@@ -531,7 +547,7 @@ def main():
             else:
                 alert_failed = True
 
-    # 送信に失敗した時は「買い時ゾーンに入った」ことを記録しない（次回また最初の通知として試す）
+    # 送信に失敗した時は「平均より安めゾーンに入った」ことを記録しない（次回また最初の通知として試す）
     if not alert_failed:
         store["last_zone"] = result["zone"]
     save_store(store)
